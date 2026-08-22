@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.venv/
+foto_terima.jpg
+foto_upscale.png
