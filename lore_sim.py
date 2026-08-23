@@ -85,26 +85,41 @@ def launch(path: Path) -> None:
     subprocess.run([sys.executable,str(ROOT/'simulation'/'launch_three_terminals.py'),'--scenario',str(path)],check=True)
 
 
-def ask_node_delay(node: str) -> str:
-    print(f"\nScenario playback speed for Tian {node}:")
-    print("  normal    = +0 seconds between scripted actions; uses JSON delays exactly")
-    print("  slow      = +2 seconds between scripted actions; easy to follow by eye")
-    print("  very-slow = +5 seconds between scripted actions; best for demos/debugging")
+def ask_tx_delay(node: str) -> str:
+    print(f"\nREAL packet/frame transmission speed for Tian {node}:")
+    print("  normal    = 0 seconds between DATA/END/NACK/COMPLETE frames (very fast)")
+    print("  slow      = 0.25 seconds between frames (easy to watch packet-by-packet)")
+    print("  very-slow = 1 second between frames (demo/debug speed)")
+    print("  number    = custom seconds, for example 0.5")
+    return ask(f"{node} TX delay", "normal")
+
+
+def ask_node_pacing(node: str) -> str:
+    print(f"\nScenario ACTION pacing for Tian {node} (separate from packet speed):")
+    print("  normal    = +0 seconds between scripted actions; uses action delays exactly")
+    print("  slow      = +2 seconds between scripted actions")
+    print("  very-slow = +5 seconds between scripted actions")
     print("  number    = custom extra seconds, for example 1.5")
-    return ask(f"{node} pacing", "normal")
+    return ask(f"{node} scenario pacing", "normal")
 
 
 def launch_live() -> None:
     print("\n=== LIVE INTERACTIVE TWO-TIAN SIMULATION ===")
     print("Three terminals will open: Channel Panel, Tian A, Tian B.")
     print("Both Tian terminals accept normal text and /image <path> live.")
-    print("Each Tian terminal can also load its own node scenario with /load <file.json>.")
-    print("Each node also has independent scenario pacing with /delay.")
+    print("Each Tian terminal can create/select/run its own node scenario.")
+    print("\nIMPORTANT:")
+    print("  /delay  = REAL delay between protocol frames (DATA/END/NACK/COMPLETE)")
+    print("  /pacing = extra delay between scenario actions/messages")
+
+    a_tx_delay=ask_tx_delay("A")
+    b_tx_delay=ask_tx_delay("B")
+
     print("\nOptional startup node scenarios:")
     a_raw=ask("A scenario path (Enter = manual only)","")
     b_raw=ask("B scenario path (Enter = manual only)","")
-    a_delay=ask_node_delay("A") if a_raw else "normal"
-    b_delay=ask_node_delay("B") if b_raw else "normal"
+    a_pacing=ask_node_pacing("A") if a_raw else None
+    b_pacing=ask_node_pacing("B") if b_raw else None
     autorun=False
     if a_raw or b_raw:
         autorun=ask("Autorun loaded scenario(s)? y/n","n").lower().startswith('y')
@@ -112,9 +127,11 @@ def launch_live() -> None:
         sys.executable,
         str(ROOT/'simulation'/'launch_live_terminals.py'),
         '--panel-scenario',str(LIVE_CHANNEL_SCENARIO),
-        '--a-delay',a_delay,
-        '--b-delay',b_delay,
+        '--a-delay',a_tx_delay,
+        '--b-delay',b_tx_delay,
     ]
+    if a_pacing is not None: command += ['--a-pacing',a_pacing]
+    if b_pacing is not None: command += ['--b-pacing',b_pacing]
     if a_raw: command += ['--a-scenario',str(Path(a_raw).expanduser().resolve())]
     if b_raw: command += ['--b-scenario',str(Path(b_raw).expanduser().resolve())]
     if autorun: command += ['--autorun']
