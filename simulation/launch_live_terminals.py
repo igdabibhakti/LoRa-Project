@@ -17,7 +17,7 @@ args = ap.parse_args()
 panel_scenario = str(Path(args.panel_scenario).expanduser().resolve())
 
 commands = [
-    f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.panel --live --scenario {shlex.quote(panel_scenario)}",
+    f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.live_panel --scenario {shlex.quote(panel_scenario)}",
 ]
 for name, node_id, scenario, delay, pacing in [
     ("A", 1, args.a_scenario, args.a_delay, args.a_pacing),
@@ -53,6 +53,7 @@ for command in commands:
 
 print("Started live 3-terminal simulation")
 print(f"Panel channel scenario: {panel_scenario}")
+print("Panel terminal supports: /scenario list | select | preview | make")
 print(f"A REAL TX frame delay: {args.a_delay}")
 print(f"B REAL TX frame delay: {args.b_delay}")
 if args.a_pacing is not None: print(f"A scenario action pacing override: {args.a_pacing}")
