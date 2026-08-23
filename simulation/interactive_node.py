@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lore_protocol import ContentType, Frame, FrameType, decode_missing_indexes
 from simulation.common import b64d, b64e, recv_lines, send_json
+from simulation.experiment_trace import print_trace_block, print_transfer_summary, transfer_summary
 from simulation.node_scenario_manager import NodeScenarioStore, run_terminal_builder
 from tian_payload import decode_received, prepare_image, prepare_text
 from tian_software import TianSoftware
@@ -66,23 +67,14 @@ class ScenarioPlayer:
 
     def set_delay(self, raw: str | float | int | None = None) -> None:
         if raw is None:
-            print(
-                f"[DELAY] {self.delay_name} = +{self.extra_delay:g}s between scripted actions",
-                flush=True,
-            )
-            print(
-                "[DELAY] normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s",
-                flush=True,
-            )
+            print(f"[DELAY] {self.delay_name} = +{self.extra_delay:g}s between scripted actions", flush=True)
+            print("[DELAY] normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s", flush=True)
             return
         name, seconds = parse_scenario_delay(str(raw))
         self.delay_name = name
         self.extra_delay = seconds
         if self.config:
-            if name.startswith("custom-"):
-                self.config["pacing"] = seconds
-            else:
-                self.config["pacing"] = name
+            self.config["pacing"] = seconds if name.startswith("custom-") else name
         print(f"[DELAY] set to {name}: +{seconds:g}s between scripted actions", flush=True)
         if seconds == 0:
             print("[DELAY] NORMAL: scenario uses only each action's own delay.", flush=True)
@@ -101,10 +93,7 @@ class ScenarioPlayer:
         if apply_saved_pacing and "pacing" in cfg:
             self.set_delay(cfg["pacing"])
         print(f"[SCENARIO] loaded {len(self.actions)} actions from {path}", flush=True)
-        print(
-            f"[SCENARIO] pacing={self.delay_name} (+{self.extra_delay:g}s between actions)",
-            flush=True,
-        )
+        print(f"[SCENARIO] pacing={self.delay_name} (+{self.extra_delay:g}s between actions)", flush=True)
 
     def run(self) -> None:
         if not self.actions:
@@ -119,10 +108,7 @@ class ScenarioPlayer:
         self.pause_event.clear()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        print(
-            f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)} pacing={self.delay_name}",
-            flush=True,
-        )
+        print(f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)} pacing={self.delay_name}", flush=True)
 
     def _worker(self) -> None:
         while self.index < len(self.actions) and not self.stop_event.is_set():
@@ -210,9 +196,19 @@ class InteractiveNode:
         self.running = True
         self.scenario_store = NodeScenarioStore(ROOT)
         self.scenario = ScenarioPlayer(self)
+        self.pending_encode_traces: list[dict] = []
+        self.current_encode_trace: dict | None = None
+        self.tx_round = 0
+
+    def report_encode(self, prepared) -> None:
+        trace = dict(prepared.trace)
+        self.pending_encode_traces.append(trace)
+        print_trace_block("TIAN ENCODING PROCESS", trace)
+        send_json(self.sock, {"type": "TRACE", "node": self.name, "stage": "ENCODE", "trace": trace})
 
     def enqueue_text(self, text: str) -> None:
         prepared = prepare_text(text)
+        self.report_encode(prepared)
         self.tian.queue_message(prepared.encrypted, ContentType.TEXT, "interactive-text")
         print(
             f"[QUEUE] TEXT {text!r} bytes={prepared.original_size} processed={prepared.processed_size}B depth={len(self.tian.outgoing)}",
@@ -230,9 +226,11 @@ class InteractiveNode:
         except Exception as exc:
             print(f"[ERROR] cannot prepare image: {exc}", flush=True)
             return
+        self.report_encode(prepared)
         self.tian.queue_message(prepared.encrypted, ContentType.IMAGE, prepared.display_name)
         print(
-            f"[QUEUE] IMAGE {prepared.display_name!r} original={prepared.original_size}B processed={prepared.processed_size}B depth={len(self.tian.outgoing)}",
+            f"[QUEUE] IMAGE {prepared.display_name!r} original={prepared.original_size}B "
+            f"processed={prepared.processed_size}B depth={len(self.tian.outgoing)}",
             flush=True,
         )
         self.request_channel_if_needed()
@@ -283,7 +281,6 @@ class InteractiveNode:
         subcommand, _, value = raw.partition(" ")
         subcommand = subcommand.lower()
         value = value.strip()
-
         if not subcommand:
             self.scenario.status()
             print("Use /scenario list | select <n/name> | preview | make", flush=True)
@@ -329,31 +326,24 @@ class InteractiveNode:
                     self.scenario.preview()
                 else:
                     print("Usage: /load <node-scenario.json>", flush=True)
-            elif command == "run":
-                self.scenario.run()
-            elif command == "pause":
-                self.scenario.pause()
-            elif command == "resume":
-                self.scenario.resume()
+            elif command == "run": self.scenario.run()
+            elif command == "pause": self.scenario.pause()
+            elif command == "resume": self.scenario.resume()
             elif command == "stop":
-                self.scenario.stop()
-                print("[SCENARIO] stopped", flush=True)
-            elif command == "delay":
-                self.scenario.set_delay(argument)
-            elif command == "scenario":
-                self.scenario_command(argument)
+                self.scenario.stop(); print("[SCENARIO] stopped", flush=True)
+            elif command == "delay": self.scenario.set_delay(argument)
+            elif command == "scenario": self.scenario_command(argument)
             elif command == "status":
                 print(
                     f"[STATUS] pending={self.tian.has_pending} outbound_busy={self.tian.outbound_busy} "
-                    f"queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}",
-                    flush=True,
+                    f"queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}", flush=True,
                 )
                 self.scenario.status()
             elif command == "help":
                 print(
                     "Commands:\n"
-                    "  normal text                   send a text message immediately\n"
-                    "  /image <path>                 send an image manually\n"
+                    "  normal text                   send text + show encoding/transmission detail\n"
+                    "  /image <path>                 send image + show codec/transmission detail\n"
                     "  /scenario list               list saved node scenarios\n"
                     "  /scenario select <n/name>    select + preview + preload an old scenario\n"
                     "  /scenario preview            preview currently loaded scenario\n"
@@ -371,10 +361,23 @@ class InteractiveNode:
                     "  /quit                         exit this Tian terminal",
                     flush=True,
                 )
-            elif command == "quit":
-                self.running = False
+            elif command == "quit": self.running = False
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[ERROR] {exc}", flush=True)
+
+    def send_frames_with_detail(self, frames: list[bytes], title: str) -> None:
+        if not frames:
+            return
+        summary = transfer_summary(frames)
+        print_transfer_summary(summary, title)
+        send_json(self.sock, {"type": "TRACE", "node": self.name, "stage": "TX_WINDOW", "trace": summary})
+        for raw in frames:
+            frame = Frame.decode(raw)
+            print(
+                f"[TX] {desc(frame)} message_id=0x{frame.message_id:08X} content={frame.content_type.name} frame_bytes={len(raw)}",
+                flush=True,
+            )
+            send_json(self.sock, {"type": "FRAME", "node": self.name, "data": b64e(raw)})
 
     def handle_message(self, message: dict) -> None:
         typ = message["type"]
@@ -382,19 +385,22 @@ class InteractiveNode:
             self.requested = False
             print(f"[CHANNEL] GRANTED backoff={message.get('backoff_ms')}ms", flush=True)
             frames = self.tian.begin_next_transfer()
-            for raw in frames:
-                print(f"[TX] {desc(Frame.decode(raw))}", flush=True)
-                send_json(self.sock, {"type": "FRAME", "node": self.name, "data": b64e(raw)})
+            self.current_encode_trace = self.pending_encode_traces.pop(0) if self.pending_encode_traces else None
+            self.tx_round = 0
+            self.send_frames_with_detail(frames, "INITIAL TRANSMISSION")
             self.last_tx = time.monotonic()
         elif typ == "FRAME":
             raw = b64d(message["data"])
             frame = Frame.decode(raw)
-            print(f"[RX] {desc(frame)}", flush=True)
+            print(
+                f"[RX] {desc(frame)} message_id=0x{frame.message_id:08X} content={frame.content_type.name} frame_bytes={len(raw)}",
+                flush=True,
+            )
             responses = self.tian.handle_encoded_frame(raw)
-            for outgoing in responses:
-                print(f"[TX] {desc(Frame.decode(outgoing))}", flush=True)
-                send_json(self.sock, {"type": "FRAME", "node": self.name, "data": b64e(outgoing)})
             if responses:
+                self.tx_round += 1
+                title = "PROTOCOL RESPONSE" if frame.frame_type != FrameType.NACK else f"SELECTIVE RETRANSMISSION ROUND {self.tx_round}"
+                self.send_frames_with_detail(responses, title)
                 self.last_tx = time.monotonic()
             for received in self.tian.pop_received_messages():
                 decoded = decode_received(
@@ -402,6 +408,16 @@ class InteractiveNode:
                     received.content_type,
                     output_dir=ROOT / "received",
                     output_stem=f"node_{self.name}_from_{received.source_node_id}_{received.message_id:08X}",
+                )
+                print_trace_block("TIAN DECODING PROCESS", decoded.get("trace", {}))
+                send_json(
+                    self.sock,
+                    {"type": "TRACE", "node": self.name, "stage": "DECODE", "trace": decoded.get("trace", {})},
+                )
+                print(
+                    f"[EXPERIMENT] RECEIVE COMPLETE message_id=0x{received.message_id:08X} "
+                    f"source={received.source_node_id} content={received.content_type.name}",
+                    flush=True,
                 )
                 if decoded["type"] == "text":
                     print(f"\n[MESSAGE] TEXT from={received.source_node_id}: {decoded['text']}\n", flush=True)
@@ -412,70 +428,57 @@ class InteractiveNode:
                         flush=True,
                     )
             if frame.frame_type == FrameType.COMPLETE and not self.tian.outbound_busy:
-                print("[TRANSFER] COMPLETE", flush=True)
+                print(
+                    f"[TRANSFER] COMPLETE message_id=0x{frame.message_id:08X}; reliable transaction finished",
+                    flush=True,
+                )
+                self.current_encode_trace = None
                 self.request_channel_if_needed()
         elif typ == "STOP":
             self.running = False
 
-    def run(
-        self,
-        startup_scenario: str | None = None,
-        autorun: bool = False,
-        startup_delay: str | None = None,
-    ) -> None:
+    def run(self, startup_scenario: str | None = None, autorun: bool = False, startup_delay: str | None = None) -> None:
         print(f"=== LIVE TIAN SOFTWARE {self.name} (node_id={self.node_id}) ===", flush=True)
         print("Normal text sends live. Type /help for commands.", flush=True)
-        print("Node scenarios can now be CREATED, PREVIEWED, SAVED, and SELECTED entirely in this terminal.", flush=True)
+        print("EXPERIMENT VIEW is enabled: encode, packet/frame, retransmission, and decode details are shown.", flush=True)
+        print("Node scenarios can be CREATED, PREVIEWED, SAVED, and SELECTED entirely in this terminal.", flush=True)
         print("Start with /scenario list or /scenario make.", flush=True)
         print("Scenario pacing: normal=+0s, slow=+2s, very-slow=+5s.", flush=True)
-
         if startup_scenario:
-            try:
-                self.scenario.load(startup_scenario)
-            except Exception as exc:
-                print(f"[ERROR] startup scenario: {exc}", flush=True)
+            try: self.scenario.load(startup_scenario)
+            except Exception as exc: print(f"[ERROR] startup scenario: {exc}", flush=True)
         if startup_delay is not None:
-            try:
-                self.scenario.set_delay(startup_delay)
-            except ValueError as exc:
-                print(f"[ERROR] startup delay: {exc}; keeping scenario/default pacing", flush=True)
+            try: self.scenario.set_delay(startup_delay)
+            except ValueError as exc: print(f"[ERROR] startup delay: {exc}; keeping scenario/default pacing", flush=True)
         if autorun and self.scenario.actions:
             self.scenario.run()
-
         threading.Thread(target=self.stdin_worker, daemon=True).start()
         buffer = b""
         while self.running:
             while True:
-                try:
-                    command, argument = self.command_queue.get_nowait()
-                except queue.Empty:
-                    break
+                try: command, argument = self.command_queue.get_nowait()
+                except queue.Empty: break
                 self.handle_command(command, argument)
             self.request_channel_if_needed()
             self.sock.settimeout(0.05)
             try:
                 messages, buffer, ok = recv_lines(self.sock, buffer)
             except socket.timeout:
-                messages = []
-                ok = True
+                messages = []; ok = True
             if not ok:
-                print("[CONNECTION] panel disconnected", flush=True)
-                break
+                print("[CONNECTION] panel disconnected", flush=True); break
             for message in messages:
                 self.handle_message(message)
             if self.tian.outbound_busy and time.monotonic() - self.last_tx >= self.timeout:
                 retry = self.tian.retry_after_timeout()
                 if retry:
-                    print("[TIMEOUT] no NACK/COMPLETE -> retry END", flush=True)
-                    for raw in retry:
-                        print(f"[TX] {desc(Frame.decode(raw))}", flush=True)
-                        send_json(self.sock, {"type": "FRAME", "node": self.name, "data": b64e(raw)})
+                    self.tx_round += 1
+                    print("[TIMEOUT] no NACK/COMPLETE -> retry protocol window", flush=True)
+                    self.send_frames_with_detail(retry, f"TIMEOUT RETRY ROUND {self.tx_round}")
                     self.last_tx = time.monotonic()
         self.scenario.stop()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        try: self.sock.close()
+        except OSError: pass
 
 
 def main() -> None:
@@ -489,11 +492,7 @@ def main() -> None:
     parser.add_argument("--autorun", action="store_true", help="start preloaded scenario immediately")
     parser.add_argument("--delay", help="override scenario pacing: normal, slow, very-slow, or custom seconds")
     args = parser.parse_args()
-    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(
-        args.scenario,
-        args.autorun,
-        args.delay,
-    )
+    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(args.scenario, args.autorun, args.delay)
 
 
 if __name__ == "__main__":
