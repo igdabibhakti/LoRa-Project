@@ -14,8 +14,7 @@ class Panel:
         self.seq_i = 0; self.response_seq = {}; self.tx_window = []
         self.completed = 0; self.stats = {"delivered": 0, "dropped": 0}
 
-    def log(self, text):
-        print(f"[PANEL] {text}", flush=True)
+    def log(self, text): print(f"[PANEL] {text}", flush=True)
 
     def sequence(self, index=None):
         seqs = self.cfg.get("sequences", [])
@@ -32,8 +31,7 @@ class Panel:
                 if key.data == "listener":
                     conn, _ = listener.accept(); conn.setblocking(False)
                     self.sel.register(conn, selectors.EVENT_READ, data=None); self.buffers[conn] = b""
-                else:
-                    self.read_sock(key.fileobj)
+                else: self.read_sock(key.fileobj)
             self.arbitrate()
             if len(self.nodes) == 2 and not getattr(self, "loaded", False):
                 self.loaded = True; self.load_messages()
@@ -63,12 +61,14 @@ class Panel:
             if node not in self.waiting:
                 self.waiting.append(node); self.req_times[node] = time.monotonic()
             self.log(f"{node} requests channel")
-        elif typ == "FRAME":
-            self.accept_frame(msg["node"], msg["data"])
+        elif typ == "FRAME": self.accept_frame(msg["node"], msg["data"])
 
     def load_messages(self):
         for i, msg in enumerate(self.cfg.get("messages", [])):
-            send_json(self.nodes[msg["sender"]], {"type": "ENQUEUE", "text": msg["text"], "label": msg.get("label", f"message-{i+1}")})
+            out = {"type": "ENQUEUE", "payload_type": msg.get("payload_type", "text"), "label": msg.get("label", f"message-{i+1}")}
+            if out["payload_type"] == "image": out["path"] = msg["path"]
+            else: out["text"] = msg.get("text", "")
+            send_json(self.nodes[msg["sender"]], out)
         self.log(f"loaded {len(self.cfg.get('messages', []))} queued messages")
 
     def arbitrate(self):
