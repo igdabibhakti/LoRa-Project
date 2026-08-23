@@ -1,42 +1,47 @@
-# LoRe Project — Reliable Protocol Prototype
+# LoRe Project — Dynamic Tian Node Prototype
 
-This branch improves Tian's original image/text prototype before adding the
-laptop-to-ESP32 USB link. It still simulates the radio, but the data exchanged
-by that simulator is now the same binary framing that the future transport can
-carry.
+This branch builds on `feature/reliable-half-duplex-protocol` and turns Tian's
+protocol into a transport-independent node runtime. The same Tian instance can
+initiate reliable transfers and receive/reassemble transfers.
 
-## What changed
+## What is implemented
 
-- Fixed the old packet-index mismatch. The comment claimed a 16-bit index but
-  `>HBHBB` encoded only 8 bits. Packet indexes are now genuinely 16-bit.
-- Added a random 32-bit message ID so packets from different messages are not
-  mixed together.
-- Added protocol version, source node ID, frame type, content type, and CRC-16.
-- Added explicit `DATA`, `END`, `NACK`, and `COMPLETE` frames.
-- Added paged NACKs when more than 90 packet indexes are missing.
-- Added sender and receiver sessions that cache, validate, reassemble, and
-  selectively retransmit packets.
-- Added a deterministic half-duplex simulator with optional DATA, END, and
-  response loss.
-- Put the interactive program behind `main()` so the protocol can be imported
-  later by serial/ESP32 code.
-- Store the send timestamp once per encrypted message instead of repeating it
-  in every radio packet.
-- Preserve image aspect ratio when creating the 480-pixel preview.
+- Reliable binary framing with CRC-16.
+- `DATA`, `END`, `NACK`, and `COMPLETE` frames.
+- Selective retransmission of missing DATA packets.
+- Recovery from lost DATA, lost END, and lost response windows.
+- `TianNode`, which can both send and receive using the same code.
+- Independent receive sessions keyed by `(source_node_id, message_id)`.
+- A 2-byte big-endian serial envelope for transporting encoded LoRe frames.
+- An interactive serial-node runtime with packet tracing and response timeout
+  handling.
+- Tests for A->B, B->A, packet loss/NACK, lost END, lost COMPLETE, and serial
+  framing.
 
-## Half-duplex transfer
+## Architecture
 
-Only one side owns the radio during a window:
+```text
+Tian application
+      |
+      v
+TianNode
+  - SenderSession
+  - ReceiveSession(s)
+  - DATA/END/NACK/COMPLETE
+      |
+      v
+encoded LoRe Frame bytes
+      |
+      v
+FramedSerialTransport
+      |
+      v
+USB serial / future ESP32 bridge
+```
 
-1. Sender TX / receiver RX: `DATA 0 ... DATA N, END`.
-2. Both switch direction.
-3. Receiver TX / sender RX: one or more `NACK` pages, or `COMPLETE`.
-4. If NACKed, the sender retransmits only the requested DATA packets followed
-   by another `END`.
-5. If `END` or the response is lost, the sender times out and repeats `END`.
-
-There is never a requirement for either LoRa module to transmit and receive at
-the same time.
+The ESP32 does not need to understand images, encryption, reassembly, missing
+packet decisions, or NACK generation. It only needs to move complete encoded
+LoRe frames and later control the LoRa radio TX/RX state.
 
 ## Radio frame v1
 
@@ -52,42 +57,92 @@ All integers use network byte order (big-endian).
 | Message ID | 4 | Groups all packets from one message |
 | Total/page count | 2 | DATA total, END expected total, or NACK page count |
 | Packet/page index | 2 | DATA index, retry round, or NACK page index |
-| Payload length | 1 | `0..180` for current DATA frames |
-| Payload | 0–180 | Encrypted message chunk or NACK indexes |
+| Payload length | 1 | `0..180` |
+| Payload | 0–180 | Message chunk or NACK indexes |
 | CRC-16 | 2 | CRC-16/CCITT-FALSE over header + payload |
 
-The maximum current DATA frame is 198 bytes: 16-byte header, 180-byte payload,
-and 2-byte CRC. That leaves room below a 255-byte LoRa packet limit.
+Maximum DATA frame: 198 bytes.
 
-## Run
+## Serial envelope
+
+Serial transport adds a transport-only length prefix around each encoded LoRe
+frame:
+
+```text
++----------------------+-------------------------+
+| uint16 frame length  | encoded LoRe Frame      |
+| big-endian, 2 bytes  | frame_length bytes      |
++----------------------+-------------------------+
+```
+
+The prefix is not part of the radio protocol. A future ESP32 bridge should use
+this same envelope on the laptop-facing USB serial link.
+
+## Run protocol tests
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python lora_demo.py
-```
-
-When prompted for simulated loss, enter zero-based DATA indexes such as `3,6`.
-The demo will show the TX/RX windows, NACK, retransmission, and COMPLETE.
-
-Run the tests with:
-
-```bash
 python -m unittest discover -s tests -v
 ```
 
-## Next stage: ESP32 link
+## Run a Tian serial node
 
-The future USB serial module should exchange encoded `Frame` bytes and wait for
-ESP32 `TX_DONE` before submitting the next radio frame. The ESP32 does not need
-to understand JPEG, zlib, AES-GCM, reassembly, or NACK decisions. Its eventual
-radio-facing seam is intentionally small:
+Node A:
 
-```text
-laptop serial RX -> validate serial envelope -> radio_tx(frame bytes)
-radio_rx(frame bytes, RSSI, SNR) -> serial TX -> laptop
+```bash
+python tian_serial_node.py --node-id 1 --port /dev/ttyUSB0
 ```
 
-The serial envelope itself is intentionally not implemented in this stage; it
-will be added and loopback-tested before real LoRa code.
+Node B:
+
+```bash
+python tian_serial_node.py --node-id 2 --port /dev/ttyUSB0
+```
+
+Commands:
+
+```text
+send hello from this node
+status
+quit
+```
+
+Example trace:
+
+```text
+TX node=1 msg=0x12345678 DATA #0/5
+TX node=1 msg=0x12345678 END round=0
+RX node=2 msg=0x12345678 NACK page #0/0
+TX node=1 msg=0x12345678 DATA #3/5
+TX node=1 msg=0x12345678 END round=1
+RX node=2 msg=0x12345678 COMPLETE
+```
+
+## Current half-duplex rule
+
+Each node is dynamically capable of sending and receiving, but two nodes should
+not initiate new user transfers at exactly the same time yet. Normal protocol
+turnaround is supported:
+
+```text
+A TX DATA...END -> B RX
+A RX <- B TX NACK/COMPLETE
+A TX retransmission...END -> B RX
+```
+
+A later channel-arbitration mechanism can resolve simultaneous initiation when
+more realistic radio behavior is added.
+
+## Next stage
+
+Connect `FramedSerialTransport` to an ESP32 bridge. The ESP32 contract is small:
+
+```text
+laptop serial RX -> read length -> read frame -> radio_tx(frame bytes)
+radio_rx(frame bytes) -> serial TX length + frame
+```
+
+This lets the reliability state machine remain in Tian while the ESP32 handles
+transport and LoRa TX/RX switching.
