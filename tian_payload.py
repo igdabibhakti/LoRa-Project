@@ -3,6 +3,10 @@
 This layer sits above lore_protocol.py. It handles the work Tian originally did
 before packetization: application metadata, image compression and AES-GCM.
 The ESP32/serial transport never needs to understand this format.
+
+Trace dictionaries are intentionally observational only. They let the live
+experiment show the classic Tian encode/decode process without changing bytes
+sent by the protocol.
 """
 from __future__ import annotations
 
@@ -11,7 +15,7 @@ import os
 import struct
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -22,6 +26,15 @@ from lore_protocol import ContentType
 SHARED_KEY = b"12345678901234567890123456789012"  # Demo/test key only.
 APP_HEADER_FORMAT = ">Q"
 APP_HEADER_SIZE = struct.calcsize(APP_HEADER_FORMAT)
+TRACE_HEX_BYTES = 48
+
+
+def hex_preview(data: bytes, limit: int = TRACE_HEX_BYTES) -> str:
+    view = data[:limit]
+    text = " ".join(f"{byte:02X}" for byte in view)
+    if len(data) > limit:
+        text += f" ... (+{len(data) - limit}B)"
+    return text
 
 
 @dataclass(frozen=True)
@@ -31,6 +44,7 @@ class PreparedPayload:
     original_size: int
     processed_size: int
     display_name: str
+    trace: dict = field(default_factory=dict)
 
 
 def encrypt(raw: bytes) -> bytes:
@@ -46,8 +60,9 @@ def decrypt(encrypted: bytes) -> bytes:
     return AESGCM(SHARED_KEY).decrypt(nonce, encrypted[12:], None)
 
 
-def _pack_application(raw: bytes) -> bytes:
-    return struct.pack(APP_HEADER_FORMAT, int(time.time() * 1000)) + raw
+def _pack_application(raw: bytes, sent_at_ms: int | None = None) -> bytes:
+    timestamp = int(time.time() * 1000) if sent_at_ms is None else sent_at_ms
+    return struct.pack(APP_HEADER_FORMAT, timestamp) + raw
 
 
 def _unpack_application(raw: bytes) -> tuple[int, bytes]:
@@ -59,13 +74,30 @@ def _unpack_application(raw: bytes) -> tuple[int, bytes]:
 
 def prepare_text(text: str) -> PreparedPayload:
     raw = text.encode("utf-8")
-    encrypted = encrypt(_pack_application(raw))
+    sent_at_ms = int(time.time() * 1000)
+    application = _pack_application(raw, sent_at_ms)
+    encrypted = encrypt(application)
     return PreparedPayload(
         content_type=ContentType.TEXT,
         encrypted=encrypted,
         original_size=len(raw),
         processed_size=len(encrypted),
         display_name="text",
+        trace={
+            "direction": "ENCODE",
+            "content_type": "TEXT",
+            "display_name": "text",
+            "sent_at_ms": sent_at_ms,
+            "raw_bytes": len(raw),
+            "raw_preview": text[:120],
+            "raw_hex": hex_preview(raw),
+            "application_header_bytes": APP_HEADER_SIZE,
+            "application_bytes": len(application),
+            "application_hex": hex_preview(application),
+            "encryption": "AES-GCM (12B nonce + cipher + 16B tag)",
+            "encrypted_bytes": len(encrypted),
+            "encrypted_hex": hex_preview(encrypted),
+        },
     )
 
 
@@ -75,13 +107,19 @@ def prepare_image(path: str | Path) -> PreparedPayload:
         raise FileNotFoundError(f"image not found: {source}")
 
     original_size = source.stat().st_size
+    source_bytes = source.read_bytes()
     image = Image.open(source).convert("RGB")
+    original_dimensions = image.size
     image.thumbnail((240, 240))
+    processed_dimensions = image.size
 
     jpeg = io.BytesIO()
     image.save(jpeg, format="JPEG", quality=50)
-    compressed = zlib.compress(jpeg.getvalue(), level=9)
-    encrypted = encrypt(_pack_application(compressed))
+    jpeg_bytes = jpeg.getvalue()
+    compressed = zlib.compress(jpeg_bytes, level=9)
+    sent_at_ms = int(time.time() * 1000)
+    application = _pack_application(compressed, sent_at_ms)
+    encrypted = encrypt(application)
 
     return PreparedPayload(
         content_type=ContentType.IMAGE,
@@ -89,6 +127,28 @@ def prepare_image(path: str | Path) -> PreparedPayload:
         original_size=original_size,
         processed_size=len(encrypted),
         display_name=source.name,
+        trace={
+            "direction": "ENCODE",
+            "content_type": "IMAGE",
+            "display_name": source.name,
+            "source_path": str(source),
+            "sent_at_ms": sent_at_ms,
+            "original_bytes": original_size,
+            "original_dimensions": f"{original_dimensions[0]}x{original_dimensions[1]}",
+            "source_hex": hex_preview(source_bytes),
+            "rgb_thumbnail": f"{processed_dimensions[0]}x{processed_dimensions[1]}",
+            "jpeg_quality": 50,
+            "jpeg_bytes": len(jpeg_bytes),
+            "jpeg_hex": hex_preview(jpeg_bytes),
+            "compression": "zlib level 9",
+            "compressed_bytes": len(compressed),
+            "compressed_hex": hex_preview(compressed),
+            "application_header_bytes": APP_HEADER_SIZE,
+            "application_bytes": len(application),
+            "encryption": "AES-GCM (12B nonce + cipher + 16B tag)",
+            "encrypted_bytes": len(encrypted),
+            "encrypted_hex": hex_preview(encrypted),
+        },
     )
 
 
@@ -99,14 +159,34 @@ def decode_received(
     output_dir: str | Path = "received",
     output_stem: str = "received",
 ) -> dict:
-    sent_at_ms, application = _unpack_application(decrypt(encrypted))
+    decrypted_application = decrypt(encrypted)
+    sent_at_ms, application = _unpack_application(decrypted_application)
+    trace = {
+        "direction": "DECODE",
+        "content_type": content_type.name,
+        "encrypted_bytes": len(encrypted),
+        "encrypted_hex": hex_preview(encrypted),
+        "decryption": "AES-GCM authenticated decrypt",
+        "decrypted_application_bytes": len(decrypted_application),
+        "application_header_bytes": APP_HEADER_SIZE,
+        "sent_at_ms": sent_at_ms,
+        "application_bytes": len(application),
+        "application_hex": hex_preview(application),
+    }
 
     if content_type == ContentType.TEXT:
+        text = application.decode("utf-8", errors="replace")
+        trace.update({
+            "result": "UTF-8 text",
+            "decoded_bytes": len(application),
+            "text_preview": text[:120],
+        })
         return {
             "type": "text",
             "sent_at_ms": sent_at_ms,
-            "text": application.decode("utf-8", errors="replace"),
+            "text": text,
             "bytes": len(application),
+            "trace": trace,
         }
 
     if content_type == ContentType.IMAGE:
@@ -117,6 +197,13 @@ def decode_received(
         target.write_bytes(jpeg)
         with Image.open(io.BytesIO(jpeg)) as image:
             dimensions = image.size
+        trace.update({
+            "decompression": "zlib -> JPEG",
+            "jpeg_bytes": len(jpeg),
+            "jpeg_hex": hex_preview(jpeg),
+            "dimensions": f"{dimensions[0]}x{dimensions[1]}",
+            "saved_path": str(target.resolve()),
+        })
         return {
             "type": "image",
             "sent_at_ms": sent_at_ms,
@@ -124,11 +211,14 @@ def decode_received(
             "bytes": len(jpeg),
             "width": dimensions[0],
             "height": dimensions[1],
+            "trace": trace,
         }
 
+    trace.update({"result": "binary", "decoded_bytes": len(application)})
     return {
         "type": "binary",
         "sent_at_ms": sent_at_ms,
         "bytes": len(application),
         "data": application,
+        "trace": trace,
     }
