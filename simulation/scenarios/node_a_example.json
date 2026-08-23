@@ -1,5 +1,6 @@
 {
   "name": "Example scenario for Tian A",
+  "pacing": "normal",
   "actions": [
     {
       "delay": 0,
