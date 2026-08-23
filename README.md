@@ -238,30 +238,30 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full field layout and state b
 The intended future hardware pipeline is:
 
 ```text
-Text / Image / Application
-        |
-        v
-Tian Software payload processing
-        |
-        v
-Tian reliable protocol
-DATA / END / NACK / COMPLETE
-        |
-        v
-serial_transport.py
-        |
-        v
+        Text / Image / Application
+                    |
+                    v
+      Tian Software payload processing
+                    |
+                    v
+          Tian reliable protocol
+        DATA / END / NACK / COMPLETE
+                    |
+                    v
+            serial_transport.py
+                    |
+                    v
 [2-byte big-endian length][encoded LoRe frame]
-        |
-        v
-ESP32
-        |
-        v
-LoRa radio
-        |
-       RF
-        |
-        v
+                    |
+                    v
+                  ESP32
+                    |
+                    v
+                LoRa radio
+                    |
+                    RF
+                    |
+                    v
 LoRa radio -> ESP32 -> serial -> Tian Software
 ```
 
