@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from typing import Iterable
 
-from lore_protocol import CRC_SIZE, HEADER_SIZE, Frame, FrameType, crc16
+from lore_protocol import CRC_SIZE, HEADER_SIZE, Frame, FrameType
 
 
 def hex_preview(data: bytes, limit: int = 48) -> str:
@@ -51,11 +51,14 @@ def transfer_summary(raw_frames: Iterable[bytes]) -> dict:
         "data_indexes": [frame.packet_index for frame in data],
         "encoded_window_bytes": sum(len(raw) for raw in raws),
         "frame_count": len(raws),
+        # Full frame metadata is still retained for panel TRACE/metadata views.
+        # The node terminal no longer prints these a second time because its
+        # [TX]/[RX] lines are the prioritized per-frame experiment record.
         "frames": [frame_metadata(raw) for raw in raws],
     }
 
 
-def print_trace_block(title: str, trace: dict, prefix: str = "[EXPERIMENT]") -> None:
+def print_trace_block(title: str, trace: dict, prefix: str = "[EXPRIMT]") -> None:
     print(f"\n{prefix} === {title} ===", flush=True)
     preferred = [
         "direction", "content_type", "display_name", "source_path", "sent_at_ms",
@@ -81,17 +84,28 @@ def print_trace_block(title: str, trace: dict, prefix: str = "[EXPERIMENT]") -> 
 
 
 def print_transfer_summary(summary: dict, title: str = "TRANSMISSION WINDOW") -> None:
-    print(f"\n[EXPERIMENT] === {title} ===", flush=True)
-    print(f"[EXPERIMENT] message_id={summary.get('message_id')} content={summary.get('content_type')}", flush=True)
+    """Print only the transmission-window summary on Tian node terminals.
+
+    Per-frame details are intentionally NOT printed here anymore. The live node
+    already prints every frame as [TX] or [RX], with the protocol command first
+    (DATA/END/NACK/COMPLETE) followed by message/content/frame information.
+    Keeping only one per-frame line makes direction and protocol state easy to
+    scan while full frame metadata remains available to the panel TRACE view.
+    """
+
+    print(f"\n[EXPRIMT] === {title} ===", flush=True)
     print(
-        f"[EXPERIMENT] DATA frames={summary.get('data_frames')} indexes={summary.get('data_indexes')} "
+        f"[EXPRIMT] message_id={summary.get('message_id')} content={summary.get('content_type')}",
+        flush=True,
+    )
+    print(
+        f"[EXPRIMT] DATA frames={summary.get('data_frames')} indexes={summary.get('data_indexes')} "
         f"all_frames={summary.get('frame_count')} encoded_window={summary.get('encoded_window_bytes')}B",
         flush=True,
     )
-    for meta in summary.get("frames", []):
-        suffix = f" index={meta['packet_index']}/{meta['total_packets']}" if meta["frame_type"] == "DATA" else ""
+    if "tx_delay_name" in summary:
         print(
-            f"[EXPERIMENT] {meta['frame_type']}{suffix} frame={meta['frame_bytes']}B "
-            f"payload={meta['payload_bytes']}B header={meta['header_bytes']}B crc={meta['crc16']}",
+            f"[EXPRIMT] tx_delay={summary.get('tx_delay_name')} "
+            f"inter_frame_delay={summary.get('inter_frame_delay_ms', 0)}ms",
             flush=True,
         )
