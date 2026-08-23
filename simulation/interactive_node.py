@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lore_protocol import ContentType, Frame, FrameType, decode_missing_indexes
 from simulation.common import b64d, b64e, recv_lines, send_json
+from simulation.node_scenario_manager import NodeScenarioStore, run_terminal_builder
 from tian_payload import decode_received, prepare_image, prepare_text
 from tian_software import TianSoftware
 
@@ -54,6 +55,7 @@ class ScenarioPlayer:
     def __init__(self, node: "InteractiveNode"):
         self.node = node
         self.path: Path | None = None
+        self.config: dict = {"name": "", "pacing": "normal", "actions": []}
         self.actions: list[dict] = []
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
@@ -62,61 +64,57 @@ class ScenarioPlayer:
         self.delay_name = "normal"
         self.extra_delay = 0.0
 
-    def set_delay(self, raw: str | None = None) -> None:
+    def set_delay(self, raw: str | float | int | None = None) -> None:
         if raw is None:
             print(
                 f"[DELAY] {self.delay_name} = +{self.extra_delay:g}s between scripted actions",
                 flush=True,
             )
             print(
-                "[DELAY] examples: normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s",
+                "[DELAY] normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s",
                 flush=True,
             )
             return
-        name, seconds = parse_scenario_delay(raw)
+        name, seconds = parse_scenario_delay(str(raw))
         self.delay_name = name
         self.extra_delay = seconds
-        print(
-            f"[DELAY] set to {name}: +{seconds:g}s between scripted actions",
-            flush=True,
-        )
+        if self.config:
+            if name.startswith("custom-"):
+                self.config["pacing"] = seconds
+            else:
+                self.config["pacing"] = name
+        print(f"[DELAY] set to {name}: +{seconds:g}s between scripted actions", flush=True)
         if seconds == 0:
-            print("[DELAY] NORMAL: scenario uses only each action's JSON delay.", flush=True)
+            print("[DELAY] NORMAL: scenario uses only each action's own delay.", flush=True)
         elif seconds <= 2:
-            print("[DELAY] SLOWER: each action after the first gets an extra short pause.", flush=True)
+            print("[DELAY] SLOW: easier to watch the sequence and packet logs.", flush=True)
         else:
-            print("[DELAY] VERY SLOW: useful when you want to read the terminal logs comfortably.", flush=True)
+            print("[DELAY] VERY SLOW: good for demos, teaching, and debugging.", flush=True)
 
-    def load(self, raw_path: str) -> None:
-        path = Path(raw_path).expanduser().resolve()
-        with path.open("r", encoding="utf-8") as handle:
-            cfg = json.load(handle)
-        actions = cfg.get("actions")
-        if not isinstance(actions, list):
-            raise ValueError("node scenario must contain actions[]")
-        for i, action in enumerate(actions):
-            if action.get("type") not in {"text", "image"}:
-                raise ValueError(f"actions[{i}].type must be text or image")
-            delay = float(action.get("delay", 0))
-            if delay < 0:
-                raise ValueError(f"actions[{i}].delay cannot be negative")
+    def load(self, raw_path: str | Path, apply_saved_pacing: bool = True) -> None:
+        path, cfg = self.node.scenario_store.load(raw_path)
         self.stop()
         self.path = path
-        self.actions = actions
+        self.config = cfg
+        self.actions = list(cfg.get("actions", []))
         self.index = 0
-        print(f"[SCENARIO] loaded {len(actions)} actions from {path}", flush=True)
+        if apply_saved_pacing and "pacing" in cfg:
+            self.set_delay(cfg["pacing"])
+        print(f"[SCENARIO] loaded {len(self.actions)} actions from {path}", flush=True)
         print(
-            f"[SCENARIO] node pacing={self.delay_name} (+{self.extra_delay:g}s between actions)",
+            f"[SCENARIO] pacing={self.delay_name} (+{self.extra_delay:g}s between actions)",
             flush=True,
         )
 
     def run(self) -> None:
         if not self.actions:
-            print("[SCENARIO] nothing loaded; use /load <file.json>", flush=True)
+            print("[SCENARIO] nothing loaded; use /scenario list, /scenario select, or /scenario make", flush=True)
             return
         if self.thread and self.thread.is_alive():
             print("[SCENARIO] already running", flush=True)
             return
+        if self.index >= len(self.actions):
+            self.index = 0
         self.stop_event.clear()
         self.pause_event.clear()
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -132,6 +130,12 @@ class ScenarioPlayer:
             base_delay = float(action.get("delay", 0))
             pacing_delay = self.extra_delay if self.index > 0 else 0.0
             delay = base_delay + pacing_delay
+            if delay > 0:
+                print(
+                    f"[SCENARIO] next action #{self.index + 1} in {delay:g}s "
+                    f"(action={base_delay:g}s + pacing={pacing_delay:g}s)",
+                    flush=True,
+                )
             deadline = time.monotonic() + delay
             while time.monotonic() < deadline and not self.stop_event.is_set():
                 while self.pause_event.is_set() and not self.stop_event.is_set():
@@ -180,9 +184,16 @@ class ScenarioPlayer:
         if self.pause_event.is_set():
             state = "paused"
         print(
-            f"[SCENARIO] state={state} file={self.path or '-'} progress={self.index}/{len(self.actions)} pacing={self.delay_name} extra_delay=+{self.extra_delay:g}s",
+            f"[SCENARIO] state={state} file={self.path or '-'} progress={self.index}/{len(self.actions)} "
+            f"pacing={self.delay_name} extra_delay=+{self.extra_delay:g}s",
             flush=True,
         )
+
+    def preview(self) -> None:
+        if not self.actions:
+            print("[SCENARIO] no scenario loaded", flush=True)
+            return
+        self.node.scenario_store.preview(self.config, self.path, "LOADED SCENARIO PREVIEW")
 
 
 class InteractiveNode:
@@ -197,6 +208,7 @@ class InteractiveNode:
         self.requested = False
         self.last_tx = time.monotonic()
         self.running = True
+        self.scenario_store = NodeScenarioStore(ROOT)
         self.scenario = ScenarioPlayer(self)
 
     def enqueue_text(self, text: str) -> None:
@@ -256,6 +268,7 @@ class InteractiveNode:
                 "/stop": "stop",
                 "/delay": "delay",
                 "/scenario": "scenario",
+                "/protocol": "scenario",
                 "/status": "status",
                 "/help": "help",
                 "/quit": "quit",
@@ -264,6 +277,42 @@ class InteractiveNode:
                 print(f"[ERROR] unknown command {command}; type /help", flush=True)
                 continue
             self.command_queue.put((mapping[command], argument or None))
+
+    def scenario_command(self, argument: str | None) -> None:
+        raw = (argument or "").strip()
+        subcommand, _, value = raw.partition(" ")
+        subcommand = subcommand.lower()
+        value = value.strip()
+
+        if not subcommand:
+            self.scenario.status()
+            print("Use /scenario list | select <n/name> | preview | make", flush=True)
+            return
+        if subcommand in {"list", "ls"}:
+            self.scenario_store.print_list()
+            return
+        if subcommand in {"preview", "show"}:
+            self.scenario.preview()
+            return
+        if subcommand in {"select", "use", "load"}:
+            path = self.scenario_store.resolve(value)
+            self.scenario.load(path)
+            self.scenario.preview()
+            return
+        if subcommand in {"make", "new", "edit", "builder"}:
+            new_path = run_terminal_builder(
+                self.name,
+                self.scenario_store,
+                self.scenario.path,
+                self.scenario.config if self.scenario.actions else None,
+                self.scenario.config.get("pacing", self.scenario.delay_name),
+            )
+            if new_path:
+                self.scenario.load(new_path)
+                self.scenario.preview()
+                print("[SCENARIO] New file is preloaded. Type /run when ready.", flush=True)
+            return
+        print("Usage: /scenario list | select <number/name/path> | preview | make", flush=True)
 
     def handle_command(self, command: str, argument: str | None) -> None:
         try:
@@ -277,6 +326,7 @@ class InteractiveNode:
             elif command == "load":
                 if argument:
                     self.scenario.load(argument)
+                    self.scenario.preview()
                 else:
                     print("Usage: /load <node-scenario.json>", flush=True)
             elif command == "run":
@@ -291,32 +341,34 @@ class InteractiveNode:
             elif command == "delay":
                 self.scenario.set_delay(argument)
             elif command == "scenario":
-                self.scenario.status()
+                self.scenario_command(argument)
             elif command == "status":
                 print(
-                    f"[STATUS] pending={self.tian.has_pending} outbound_busy={self.tian.outbound_busy} queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}",
+                    f"[STATUS] pending={self.tian.has_pending} outbound_busy={self.tian.outbound_busy} "
+                    f"queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}",
                     flush=True,
                 )
                 self.scenario.status()
             elif command == "help":
                 print(
                     "Commands:\n"
-                    "  normal text          send a text message\n"
-                    "  /image <path>        send an image\n"
-                    "  /load <file.json>    load this node's scenario\n"
-                    "  /run                 run loaded scenario\n"
-                    "  /pause               pause scenario\n"
-                    "  /resume              resume scenario\n"
-                    "  /stop                stop scenario\n"
-                    "  /delay               show current scenario pacing\n"
-                    "  /delay normal        +0s between scripted actions (JSON timing only)\n"
-                    "  /delay slow          +2s between scripted actions\n"
-                    "  /delay very-slow     +5s between scripted actions\n"
-                    "  /delay 1.5           custom +1.5s between scripted actions\n"
-                    "  /scenario            show scenario progress and pacing\n"
-                    "  /status              show node status\n"
-                    "  /help                show commands\n"
-                    "  /quit                exit live simulation",
+                    "  normal text                   send a text message immediately\n"
+                    "  /image <path>                 send an image manually\n"
+                    "  /scenario list               list saved node scenarios\n"
+                    "  /scenario select <n/name>    select + preview + preload an old scenario\n"
+                    "  /scenario preview            preview currently loaded scenario\n"
+                    "  /scenario make               terminal-only scenario builder/editor\n"
+                    "  /protocol ...                alias for /scenario ...\n"
+                    "  /load <file.json>             direct-path preload (power-user shortcut)\n"
+                    "  /run                          run loaded scenario\n"
+                    "  /pause /resume /stop          control scenario playback\n"
+                    "  /delay normal                 +0s extra between scripted actions\n"
+                    "  /delay slow                   +2s extra between scripted actions\n"
+                    "  /delay very-slow              +5s extra between scripted actions\n"
+                    "  /delay 1.5                    custom +1.5s extra between actions\n"
+                    "  /status                       node + scenario status\n"
+                    "  /help                         show commands\n"
+                    "  /quit                         exit this Tian terminal",
                     flush=True,
                 )
             elif command == "quit":
@@ -352,13 +404,11 @@ class InteractiveNode:
                     output_stem=f"node_{self.name}_from_{received.source_node_id}_{received.message_id:08X}",
                 )
                 if decoded["type"] == "text":
-                    print(
-                        f"\n[MESSAGE] TEXT from={received.source_node_id}: {decoded['text']}\n",
-                        flush=True,
-                    )
+                    print(f"\n[MESSAGE] TEXT from={received.source_node_id}: {decoded['text']}\n", flush=True)
                 elif decoded["type"] == "image":
                     print(
-                        f"\n[MESSAGE] IMAGE from={received.source_node_id} saved={decoded['path']} size={decoded['width']}x{decoded['height']} jpeg={decoded['bytes']}B\n",
+                        f"\n[MESSAGE] IMAGE from={received.source_node_id} saved={decoded['path']} "
+                        f"size={decoded['width']}x{decoded['height']} jpeg={decoded['bytes']}B\n",
                         flush=True,
                     )
             if frame.frame_type == FrameType.COMPLETE and not self.tian.outbound_busy:
@@ -374,20 +424,24 @@ class InteractiveNode:
         startup_delay: str | None = None,
     ) -> None:
         print(f"=== LIVE TIAN SOFTWARE {self.name} (node_id={self.node_id}) ===", flush=True)
-        print("Type /help for commands. Normal text sends immediately when the channel is available.", flush=True)
-        print("Scenario pacing defaults to NORMAL. Use /delay slow if you want easier-to-read scripted playback.", flush=True)
+        print("Normal text sends live. Type /help for commands.", flush=True)
+        print("Node scenarios can now be CREATED, PREVIEWED, SAVED, and SELECTED entirely in this terminal.", flush=True)
+        print("Start with /scenario list or /scenario make.", flush=True)
+        print("Scenario pacing: normal=+0s, slow=+2s, very-slow=+5s.", flush=True)
+
+        if startup_scenario:
+            try:
+                self.scenario.load(startup_scenario)
+            except Exception as exc:
+                print(f"[ERROR] startup scenario: {exc}", flush=True)
         if startup_delay is not None:
             try:
                 self.scenario.set_delay(startup_delay)
             except ValueError as exc:
-                print(f"[ERROR] startup delay: {exc}; using normal", flush=True)
-        if startup_scenario:
-            try:
-                self.scenario.load(startup_scenario)
-                if autorun:
-                    self.scenario.run()
-            except Exception as exc:
-                print(f"[ERROR] startup scenario: {exc}", flush=True)
+                print(f"[ERROR] startup delay: {exc}; keeping scenario/default pacing", flush=True)
+        if autorun and self.scenario.actions:
+            self.scenario.run()
+
         threading.Thread(target=self.stdin_worker, daemon=True).start()
         buffer = b""
         while self.running:
@@ -433,10 +487,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=1.2)
     parser.add_argument("--scenario", help="optional node scenario JSON to preload")
     parser.add_argument("--autorun", action="store_true", help="start preloaded scenario immediately")
-    parser.add_argument(
-        "--delay",
-        help="scenario pacing: normal, slow, very-slow, or custom extra seconds",
-    )
+    parser.add_argument("--delay", help="override scenario pacing: normal, slow, very-slow, or custom seconds")
     args = parser.parse_args()
     InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(
         args.scenario,
