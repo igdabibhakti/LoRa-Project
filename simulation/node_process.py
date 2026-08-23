@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def desc(f):
-    if f.frame_type == FrameType.DATA: return f"DATA #{f.packet_index + 1}/{f.total_packets}"
+    if f.frame_type == FrameType.DATA: return f"DATA index={f.packet_index} total={f.total_packets}"
     if f.frame_type == FrameType.END: return f"END round={f.packet_index}"
     if f.frame_type == FrameType.NACK: return f"NACK {decode_missing_indexes(f.payload)}"
     return "COMPLETE"
