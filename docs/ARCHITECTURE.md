@@ -1,200 +1,176 @@
 # Architecture
 
-This document describes the current Tian Software reliability branch and the simulation architecture used before ESP32 + LoRa integration.
+This document explains how the current LoRe/Tian Software branch is structured and why the responsibilities are divided the way they are.
 
 ## 1. System goal
 
-The final intended physical path is:
+The project is building a reliable half-duplex data link that can eventually move text and processed images over:
 
 ```text
-Laptop application/user
-    -> Tian Software
-    -> ESP32
-    -> LoRa radio
-    -> RF
-    -> LoRa radio
-    -> ESP32
-    -> Tian Software
-    -> laptop application/user
+Laptop
+  -> Tian Software
+  -> ESP32
+  -> LoRa radio
+  -> RF
+  -> LoRa radio
+  -> ESP32
+  -> Tian Software
+  -> Laptop application/user
 ```
 
-The current branch replaces ESP32 + LoRa with a three-process simulator so the reliability protocol can be tested first.
+The current branch replaces the ESP32 + LoRa middle with a simulation transport so the laptop-side logic can be tested first.
 
-## 2. Responsibility split
+## 2. Main responsibilities
 
 ### Tian Software
 
-Tian Software owns:
+Tian Software owns application and reliability logic:
 
-- text/image input
+- user/application payload input
+- text encoding
 - image preprocessing
-- timestamp application metadata
+- timestamp insertion
 - AES-GCM encryption/decryption
-- LoRe DATA packetization
+- packetization into LoRe DATA frames
 - END generation
-- receive-session state
-- missing-DATA detection
+- receive-session tracking
+- missing-packet detection
 - NACK generation
-- multi-page NACK collection
 - selective retransmission
 - COMPLETE processing
+- outbound message queue
 - timeout-driven END retry
-- outgoing FIFO queue
 - message reconstruction
-- received text/image output
-
-### Panel / simulated channel
-
-The Panel replaces the shared RF medium during testing. It owns:
-
-- A/B connections
-- channel requests
-- randomized contention/backoff
-- current reliable-transaction ownership
-- routing encoded LoRe frames between A and B
-- configured DATA loss
-- configured END/NACK/COMPLETE loss
-- PASS/DROP logging
-- random-seed behavior
-- experiment metadata display
-- channel-scenario selection/building
-- channel release after a delivered COMPLETE
-
-The Panel does **not** reconstruct application messages and does **not** decide which DATA indexes are missing. Missing detection and NACK creation remain inside the receiving Tian Software process.
+- received text display
+- received image output
 
 ### ESP32 later
 
-The intended ESP32 role is a frame transport/radio bridge:
+The ESP32 is intended to be a transport/radio bridge:
+
+- receive one encoded LoRe frame from Tian Software over serial
+- transmit that frame through the LoRa radio
+- receive an encoded LoRe frame from LoRa
+- return that frame to Tian Software over serial
+- manage radio TX/RX switching
+- eventually provide real channel-clear / channel-activity information if required
+
+The ESP32 should not need to understand JPEG, zlib, AES-GCM, missing indexes, or how NACKs are computed.
+
+### Simulation panel now
+
+The simulation panel temporarily replaces the shared RF medium. It:
+
+- accepts connections from Tian Software A and B
+- receives channel requests
+- performs randomized contention/backoff
+- tracks the current transaction owner
+- routes encoded LoRe frames between A and B
+- applies configured DATA/END/NACK/COMPLETE loss
+- records PASS/DROP events and statistics
+- releases the channel after a delivered COMPLETE
+
+It does not perform Tian's reassembly or NACK logic.
+
+## 3. Three-process design
+
+The simulator deliberately runs as three independent processes:
 
 ```text
-receive encoded frame from Tian over serial
--> transmit it through LoRa
-
-receive encoded frame from LoRa
--> return it to Tian over serial
++---------------------------+
+| Simulation Panel          |
+| shared medium + faults    |
++-------------+-------------+
+              |
+        localhost TCP
+        /             \
+       /               \
++-----+------+      +---+--------+
+| Tian A     |      | Tian B     |
+| node_id=1  |      | node_id=2  |
++------------+      +------------+
 ```
 
-The ESP32 will also manage physical radio TX/RX switching.
+This is important because A and B are not mock objects inside one simulator process. Each side executes its own Tian Software protocol state.
 
-It should not need to understand JPEG, zlib, AES-GCM, NACK algorithms, or image reconstruction.
-
-## 3. Three-process live design
-
-```text
-                     +---------------------------+
-                     | Enhanced Live Panel       |
-                     | shared medium + faults    |
-                     | terminal scenario builder |
-                     +-------------+-------------+
-                                   |
-                             localhost TCP
-                           /               \
-                          /                 \
-               +---------+------+     +-----+----------+
-               | Tian A         |     | Tian B         |
-               | node_id = 1    |     | node_id = 2    |
-               | terminal input |     | terminal input |
-               | node scenarios |     | node scenarios |
-               +----------------+     +----------------+
-```
-
-A and B execute independent Tian protocol state. They are not mock objects inside the Panel.
-
-## 4. Live Panel layering
-
-The simulator separates the medium engine from the enhanced live terminal controls:
-
-```text
-simulation/panel.py
-    shared-medium engine
-    streaming DATA routing
-    contention
-    DATA/control-frame loss
-    sequence tracking
-    metadata capture
-
-simulation/live_panel.py
-    enhanced live terminal UI
-    /scenario list/select/preview/make
-    terminal channel-scenario builder integration
-```
-
-This keeps the original/predefined simulator path available while giving live mode richer terminal controls.
-
-## 5. Application payload path
+## 4. Application payload path
 
 ### Text
 
 ```text
-text
--> UTF-8
--> prepend 64-bit millisecond timestamp
--> AES-GCM
--> ContentType.TEXT
--> DATA packetization
+text string
+  -> UTF-8 bytes
+  -> prepend 64-bit millisecond timestamp
+  -> AES-GCM encrypt
+  -> ContentType.TEXT
+  -> packetize into DATA frames
 ```
 
-Receive path:
+On receive:
 
 ```text
-reassembled encrypted bytes
--> AES-GCM decrypt
--> remove timestamp
--> UTF-8 decode
--> final text
+reassembled encrypted payload
+  -> AES-GCM decrypt
+  -> remove timestamp
+  -> UTF-8 decode
+  -> print once
 ```
 
 ### Image
 
-Current image mode is a processed preview transfer:
+Current image mode is optimized for a compact image-transfer test:
 
 ```text
 source image
--> RGB
--> thumbnail maximum 240x240
--> JPEG quality 50
--> zlib level 9
--> prepend millisecond timestamp
--> AES-GCM
--> ContentType.IMAGE
--> DATA packetization
+  -> Pillow open
+  -> convert RGB
+  -> thumbnail to maximum 240 x 240
+  -> JPEG quality 50
+  -> zlib level 9
+  -> prepend millisecond timestamp
+  -> AES-GCM encrypt
+  -> ContentType.IMAGE
+  -> packetize
 ```
 
-Receive path:
+On receive:
 
 ```text
 reassemble
--> decrypt
--> remove timestamp
--> zlib decompress
--> JPEG bytes
--> save under received/
+  -> decrypt
+  -> remove timestamp
+  -> zlib decompress
+  -> JPEG bytes
+  -> save under received/
 ```
 
-It is not byte-perfect PNG/file preservation.
+This is not an exact original-file transfer. A PNG source becomes a processed JPEG.
 
-## 6. Protocol path
+## 5. Protocol path
+
+After the payload layer creates encrypted bytes:
 
 ```text
-prepared encrypted payload
--> DATA 0
--> DATA 1
--> ...
--> DATA N
--> END
+prepared payload
+  -> make_data_frames()
+  -> DATA 0
+  -> DATA 1
+  -> ...
+  -> DATA N
+  -> END
 ```
 
-Receiver stores DATA by packet index.
+The receiver stores DATA by `packet_index`.
 
-On END:
+When END arrives, it calculates:
 
 ```text
-expected = 0 .. total_packets-1
-received = indexes stored in receive session
-missing  = expected - received
+expected indexes = 0 .. total_packets-1
+received indexes = keys stored in receive session
+missing = expected - received
 ```
 
-If missing:
+If missing is not empty:
 
 ```text
 receiver -> NACK [missing indexes]
@@ -206,64 +182,30 @@ If complete:
 receiver -> COMPLETE
 ```
 
-A NACK causes the sender to transmit only requested DATA indexes plus a new END.
+## 6. Half-duplex transaction ownership
 
-## 7. Streaming shared-medium behavior
+The design distinguishes **transaction ownership** from instantaneous radio direction.
 
-The live Panel forwards or drops DATA **immediately** as each frame arrives.
+If A wins the channel, A owns the reliable message transaction until COMPLETE, but B must still transmit responses.
 
-Correct conceptual timing:
-
-```text
-A TX DATA 0
--> Panel PASS/DROP DATA 0
--> B RX DATA 0 if passed
-
-A TX DATA 1
--> Panel PASS/DROP DATA 1
--> B RX DATA 1 if passed
-```
-
-The Panel does not buffer a complete sender window until END.
-
-This matters because the real inter-frame delay on A/B should be visible at the receiver too.
-
-END is only the protocol boundary telling the receiver that the sender has finished the current window.
-
-## 8. How streaming loss decisions work
-
-For manual loss, the Panel already knows the configured indexes.
-
-For random probability, each expected index is selected independently using the configured probability.
-
-For exact random count on an initial window, the first DATA frame exposes `total_packets`, so the Panel can preselect exactly N indexes from:
+Example:
 
 ```text
-0 .. total_packets-1
-```
+A owns transaction
 
-before forwarding the first frame.
-
-For exact random count during retransmission, the Panel remembers the missing indexes contained in the successfully delivered NACK response. Those indexes define the next retry DATA window, allowing the Panel to preselect exact retry losses without buffering.
-
-## 9. Half-duplex transaction ownership
-
-Channel ownership is per reliable message transaction, not permanent radio direction.
-
-Example when A owns the transaction:
-
-```text
-A -> B : DATA / END
-B -> A : NACK
-A -> B : missing DATA / END
+A -> B : DATA 0,1,2,3
+A -> B : END
+B -> A : NACK [2]
+A -> B : DATA 2
+A -> B : END
 B -> A : COMPLETE
+
+release ownership
 ```
 
-Only one side transmits in each direction window, so the design fits a half-duplex LoRa radio.
+This fits one-radio half duplex because only one side transmits during each direction window.
 
-After a delivered COMPLETE, the transaction owner releases the channel.
-
-## 10. Both sides sending
+## 7. Both sides sending at once
 
 Suppose:
 
@@ -272,220 +214,356 @@ A queue = [A1, A2]
 B queue = [B1]
 ```
 
-Both can request the idle channel.
+A and B both request the idle channel.
 
-The Panel waits through the configured contention window, generates randomized backoff values and grants the smallest value.
-
-The loser remains queued.
-
-After COMPLETE releases the channel, any side with pending data may request again.
-
-This is randomized arbitration, not strict round-robin fairness.
-
-## 11. Node scenarios
-
-A node scenario controls what one Tian process wants to send.
-
-Terminal commands:
+The simulator assigns random backoffs, for example:
 
 ```text
-/scenario list
-/scenario select <number|name|path>
-/scenario preview
-/scenario make
+A = 34 ms
+B = 79 ms
 ```
 
-Node scenarios contain:
+A wins and sends A1. B's B1 remains queued.
+
+After A1 receives COMPLETE:
 
 ```text
-TEXT actions
-IMAGE actions
-per-action delay
-scenario pacing
+channel -> IDLE
 ```
 
-The terminal builder runs in the same stdin-owning thread as normal node input. This avoids multiple simultaneous `input()` calls stealing keystrokes.
+A may still have A2. B still has B1. Both are allowed to request again.
 
-The networking/main loop continues to run while the modal builder owns keyboard input.
+Therefore a later contention may be won by either A or B.
 
-## 12. Channel scenarios
+The design is not strict alternation. Winning one transaction does not permanently give the channel to that side, and losing one contention does not discard the queued message.
 
-A channel scenario controls what the simulated medium does.
+## 8. Queue behavior
 
-Panel commands:
+`tian_software.py` stores outgoing messages in a FIFO deque.
+
+`queue_message()` appends a prepared payload.
+
+`begin_next_transfer()` removes the oldest queued message and creates a `SenderSession`.
+
+A Tian Software process asks for channel access when:
+
+- it has queued data, and
+- it does not already have an active outbound transfer.
+
+After a COMPLETE, if its queue still contains another message, it may request again.
+
+## 9. Why ownership is per complete transaction
+
+Releasing the channel after every DATA frame would allow unrelated transactions to interleave:
 
 ```text
-/scenario list
-/scenario select <number|name|path>
-/scenario preview
-/scenario make
+A DATA 0
+B DATA 0
+A DATA 1
+B DATA 1
+...
 ```
 
-Channel scenarios contain transmission sequences that can configure:
+That would complicate half-duplex scheduling and response ownership.
 
-```text
-DATA loss = none/manual/random_count/random_probability
-Drop END
-Drop NACK
-Drop COMPLETE
-random seed
-contention window
-max randomized backoff
-```
+The current design instead keeps one reliable message transaction active through its DATA, END, NACK/retry, and COMPLETE cycle.
 
-Node and channel scenarios are deliberately separate concepts.
+## 10. Simulation transport vs future serial transport
 
-## 13. Lost-control recovery
+The simulator's inter-process transport is not the same as the ESP32 serial wire format.
 
-### Lost END
+### Simulation IPC
 
-```text
-sender DATA arrives
-END lost
-receiver does not evaluate window yet
-sender gets no response
-sender timeout
-sender retries END
-receiver evaluates existing DATA
-```
+The panel and Tian processes communicate using newline-delimited JSON over localhost TCP. Encoded LoRe frames are base64 encoded so they can be carried inside JSON.
 
-### Lost NACK
-
-```text
-receiver detects missing DATA
-NACK lost
-sender timeout
-sender retries END
-receiver still knows the same DATA is missing
-receiver sends NACK again
-```
-
-### Lost COMPLETE
-
-```text
-receiver is already complete
-COMPLETE lost
-sender timeout
-sender retries END
-receiver remains complete
-receiver sends COMPLETE again
-```
-
-## 14. Real TX delay and scenario pacing
-
-These are separate mechanisms.
-
-```text
-/delay
-    actual time between protocol frames sent by a Tian process
-
-/pacing
-    extra time between scripted node scenario actions
-```
-
-Current TX-delay presets:
-
-```text
-normal    0s
-slow      0.25s
-very-slow 1s
-```
-
-## 15. Observability path
-
-Tian A/B expose high-level experiment traces for application encode/decode and transmission windows.
-
-Per-frame node output prioritizes:
-
-```text
-[TX] / [RX]
--> DATA / END / NACK / COMPLETE
--> protocol/frame detail
-```
-
-High-level summaries use:
-
-```text
-[EXPRIMT]
-```
-
-The Panel can display concise ENCODE/TRANSMIT/DECODE information and optional full metadata.
-
-These traces travel only through simulation control IPC; they are not inserted into LoRe frames.
-
-## 16. Simulation IPC vs future serial
-
-### Current simulator
-
-```text
-newline JSON over localhost TCP
-encoded LoRe frame bytes represented as base64 inside JSON
-```
-
-### Future Tian <-> ESP32
+### Future Tian ↔ ESP32 serial
 
 `serial_transport.py` uses:
 
 ```text
-2-byte big-endian encoded-frame length
-followed by that many raw encoded LoRe bytes
+2-byte unsigned big-endian frame length
+followed by exactly that many encoded LoRe frame bytes
 ```
 
-The LoRe frame format and Tian reliability state should not need to change when replacing simulator IPC with ESP32 serial transport.
+This separation lets the RF simulation be removed later without changing the LoRe frame format or Tian reliability engine.
 
-## 17. Current module layout
+## 11. Current module layout
 
 ```text
 lore_sim.py
-    top-level launcher/menu
-
-lore_protocol.py
-    binary frame format, CRC, sender/receiver sessions
-
-tian_software.py
-    queue + reliability wrapper
+  terminal menu, Quick Test, JSON scenario creation/selection
 
 tian_payload.py
-    text/image application processing + AES-GCM
+  application payload processing and encryption
+
+tian_software.py
+  queue and reliability engine wrapper
+
+lore_protocol.py
+  binary frames, CRC, receive/sender sessions
 
 serial_transport.py
-    future Tian <-> ESP32 serial envelope
+  future ESP32 serial framing
 
 simulation/common.py
-    simulator JSON/base64 helpers
+  simulator JSON/base64 socket helpers
 
 simulation/panel.py
-    shared-medium engine, streaming DATA, contention, fault injection
+  medium, contention, loss injection
 
-simulation/live_panel.py
-    enhanced live Panel terminal commands + channel builder
+simulation/node_process.py
+  one independent Tian Software runtime
 
-simulation/interactive_node.py
-    live Tian A/B terminal runtime
-
-simulation/node_scenario_manager.py
-    node scenario store + terminal builder
-
-simulation/channel_scenario_manager.py
-    channel scenario store + terminal builder
-
-simulation/experiment_trace.py
-    experiment/metadata formatting
-
-simulation/launch_live_terminals.py
-    starts enhanced Panel + Tian A + Tian B
+simulation/launch_three_terminals.py
+  starts panel, A, and B in separate terminals
 ```
 
-## 18. Current assumptions/limitations
+## 12. Design assumptions today
+
+The current implementation assumes:
 
 - two communicating parties, A and B
-- no destination ID in LoRe frame yet
-- one active reliable transaction on the shared medium at a time
-- centralized Panel arbitration is simulation-only
-- fixed demo AES key
-- current image mode is reduced JPEG preview transfer
-- randomized contention does not guarantee strict fairness
-- channel scenario sequences are global in chronological window order
-- malformed/corrupt RF input handling still needs hardening for hardware use
+- one half-duplex radio per physical side later
+- one active reliable message transaction on the shared medium at a time
+- source IDs are sufficient for the present two-party topology
+- application encryption uses the same demo key at both ends
+- simulation channel arbitration is centralized for testing
 
-The next architecture stage is to preserve this protocol behavior while replacing the Panel transport boundary with ESP32 serial + LoRa radio transport.
+Future multi-node networking will need additional addressing and MAC design beyond the current branch.
+
+---
+
+## 13. Latest live-simulator additions
+
+The original architecture above remains valid. The following components were added later to make the protocol easier to experiment with from terminals.
+
+### Enhanced live Panel
+
+Live mode launches:
+
+```text
+simulation/live_panel.py
+```
+
+which extends the shared-medium behavior with interactive terminal commands such as:
+
+```text
+/metadata ...
+/scenario ...
+/protocol ...
+```
+
+The core loss/routing behavior remains in `simulation/panel.py`.
+
+### Node scenario manager
+
+```text
+simulation/node_scenario_manager.py
+```
+
+provides terminal-only creation, preview, selection, validation, save-as-new behavior, and automatic preload for Tian A/B node scenarios.
+
+### Channel scenario manager
+
+```text
+simulation/channel_scenario_manager.py
+```
+
+provides the equivalent terminal-only workflow for channel/loss scenarios.
+
+### Experiment trace helper
+
+```text
+simulation/experiment_trace.py
+```
+
+provides human-readable encode/decode and transmission-window summaries without changing LoRe frame bytes.
+
+## 14. Streaming Panel data path
+
+The current live Panel forwards or drops DATA immediately rather than buffering all DATA until END.
+
+This is important for experiment timing.
+
+Current path:
+
+```text
+Tian A TX DATA i
+      |
+      v
+Panel decides PASS/DROP now
+      |
+      +---- DROP -> nothing reaches B
+      |
+      +---- PASS -> Tian B RX DATA i immediately
+```
+
+Then the sender waits its configured inter-frame TX delay before sending the next protocol frame.
+
+END is not a signal for the Panel to release buffered DATA. END only tells the receiver that the sender finished the current window and that completeness should now be evaluated.
+
+This makes sender, Panel, and receiver traces progress together.
+
+## 15. Loss planning while streaming
+
+Streaming DATA creates one design challenge: `random_count` must still choose exactly N lost packets without waiting until END.
+
+The Panel solves this differently for initial and retry windows.
+
+### Initial window
+
+The first DATA frame contains `total_packets`, so the Panel already knows the complete expected index set:
+
+```text
+0 .. total_packets-1
+```
+
+It can preselect the exact random-loss indexes before forwarding later DATA.
+
+### Retransmission window
+
+The Panel observes delivered NACK pages and reconstructs the requested missing-index set.
+
+Example:
+
+```text
+NACK [2,5,9]
+```
+
+means the next retransmission DATA set is expected to be:
+
+```text
+[2,5,9]
+```
+
+Therefore an exact `random_count=1` retry sequence can preselect exactly one index from that set while still forwarding DATA immediately.
+
+## 16. Inter-frame TX delay vs scenario pacing
+
+The architecture now distinguishes two unrelated clocks.
+
+### TX frame delay
+
+```text
+/delay
+```
+
+controls how long a Tian process waits between transmitted protocol frames.
+
+Example:
+
+```text
+/delay slow = 0.25 s
+```
+
+means:
+
+```text
+TX DATA 0
+wait 0.25 s
+TX DATA 1
+wait 0.25 s
+TX DATA 2
+wait 0.25 s
+TX END
+```
+
+### Scenario action pacing
+
+```text
+/pacing
+```
+
+controls extra time between scripted node actions such as two separate messages/images.
+
+It does not define packet transmission speed.
+
+## 17. Single stdin ownership
+
+The node terminal builder uses Python `input()` for its modal menu.
+
+Originally the network/main loop could also invoke the builder while a dedicated stdin worker was waiting for input, creating two simultaneous keyboard readers.
+
+The current architecture avoids that:
+
+```text
+stdin_worker
+  owns all keyboard input
+  |
+  +-- ordinary A>/B> commands
+  +-- /scenario make -> builder runs in this same thread
+
+main/network loop
+  never calls input()
+  continues handling network/protocol work
+```
+
+The live Panel builder follows the same principle.
+
+## 18. Updated live module layout
+
+Additional live modules are:
+
+```text
+simulation/interactive_node.py
+  persistent Tian A/B terminal runtime
+  manual text/image input
+  scenario playback
+  packet TX delay
+  experiment traces
+  node scenario-builder integration
+
+simulation/live_panel.py
+  enhanced interactive Panel for live mode
+  metadata and channel-scenario commands
+
+simulation/node_scenario_manager.py
+  node scenario terminal builder/store
+
+simulation/channel_scenario_manager.py
+  channel scenario terminal builder/store
+
+simulation/experiment_trace.py
+  experiment metadata formatting
+
+simulation/launch_live_terminals.py
+  starts live_panel + Tian A + Tian B
+```
+
+## 19. Observability responsibility
+
+The simulator now displays codec and protocol details, but those traces are observational.
+
+They are not inserted into LoRe frames.
+
+Actual protocol bytes remain:
+
+```text
+DATA / END / NACK / COMPLETE
+```
+
+The Panel receives trace messages over simulation IPC only so it can show ENCODE / TRANSMIT / DECODE information and metadata.
+
+## 20. Current recommended architecture boundary
+
+For the next ESP32 stage, preserve this division:
+
+```text
+TIAN SOFTWARE
+  application processing
+  encryption/decryption
+  reliability sessions
+  DATA/END/NACK/COMPLETE
+  retransmission decisions
+
+ESP32
+  serial frame transport
+  LoRa TX/RX
+  half-duplex radio switching
+  hardware-specific channel/radio control
+
+LORA
+  physical RF transport
+```
+
+This keeps the tested reliability behavior on the laptop side while the ESP32 remains focused on moving already-encoded LoRe frames.
