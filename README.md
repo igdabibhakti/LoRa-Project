@@ -2,17 +2,49 @@
 
 This branch is the current reference implementation for the laptop-side **Tian Software** reliability layer before the real ESP32 + LoRa transport is connected.
 
-It supports two independent Tian Software processes, reliable half-duplex transfer, queued sending from both sides, randomized channel contention, selective retransmission with NACK, timeout recovery for lost control frames, text/image payload processing, configurable fault-injection scenarios, and a serial-ready frame boundary for future ESP32 firmware.
+It supports two independent Tian Software processes, reliable half-duplex transfer, queued sending from both sides, randomized channel contention, selective retransmission with NACK, timeout recovery for lost control frames, text/image payload processing, configurable fault-injection scenarios, a live interactive two-Tian simulation, per-node action scenarios, and a serial-ready frame boundary for future ESP32 firmware.
 
 > Terminology: **Tian Software** is the laptop-side application/protocol component. A complete physical node may later contain Tian Software + ESP32 + LoRa, but Tian Software itself is not called a node in this documentation.
+
+## IMPORTANT: start here for the new live simulation
+
+The new live simulation is a major change. It runs three persistent terminals:
+
+```text
+Terminal 1 = Channel / packet monitor panel
+Terminal 2 = Tian Software A
+Terminal 3 = Tian Software B
+```
+
+A and B can send text and images live, and **each Tian process can load its own independent node scenario**.
+
+Read this guide before using the feature:
+
+- [`docs/LIVE_SIMULATION.md`](docs/LIVE_SIMULATION.md) — complete step-by-step guide for launching live mode, manual text/image transfer, creating a separate scenario for A and B, delays, image paths, `/load`, `/run`, pause/resume/stop, autorun, channel scenarios, packet loss, contention, troubleshooting mistakes, and recommended tests.
+
+The most important distinction is:
+
+```text
+NODE SCENARIO    = what Tian A or Tian B wants to send
+CHANNEL SCENARIO = what the simulated radio channel does to the packets
+```
+
+Examples included in the repository:
+
+```text
+simulation/scenarios/node_a_example.json
+simulation/scenarios/node_b_example.json
+simulation/scenarios/live_channel.json
+```
 
 ## Documentation map
 
 Start here, then use the detailed guides when you need deeper information:
 
+- [`docs/LIVE_SIMULATION.md`](docs/LIVE_SIMULATION.md) — **new live two-Tian mode and per-node scenarios; read this first for the new feature.**
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system responsibilities, data flow, queueing, channel ownership, both-send behavior, text/image processing, and process structure.
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — binary frame format, DATA/END/NACK/COMPLETE, CRC, packet numbering, missing-packet detection, retransmission, NACK paging, timeout recovery, and protocol limits.
-- [`docs/SIMULATION_GUIDE.md`](docs/SIMULATION_GUIDE.md) — installation, Quick Test, JSON scenarios, loss syntax, random seeds, sequence semantics, examples, logs, manual three-terminal execution, and expected results.
+- [`docs/SIMULATION_GUIDE.md`](docs/SIMULATION_GUIDE.md) — original/predefined simulator, installation, Quick Test, panel JSON scenarios, loss syntax, random seeds, sequence semantics, logs, and expected results.
 - [`docs/ESP32_INTEGRATION.md`](docs/ESP32_INTEGRATION.md) — Tian Software ↔ ESP32 serial contract, future radio responsibilities, half-duplex behavior, and a staged hardware integration plan.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common setup/runtime problems such as missing Pillow, terminal launcher issues, bad image paths, ports, and interpreting stalled simulations.
 
@@ -43,11 +75,24 @@ Pillow
 pyserial
 ```
 
-Choose **1) QUICK TEST** for normal testing.
+Current menu:
+
+```text
+1) QUICK TEST (predefined messages)
+2) LIVE INTERACTIVE A <-> B
+3) Run saved JSON channel scenario
+4) View / validate JSON channel scenario
+5) Run included example
+6) Exit
+```
+
+For the new live feature choose **2** and follow [`docs/LIVE_SIMULATION.md`](docs/LIVE_SIMULATION.md).
+
+For the original predefined simulator choose **1**.
 
 ## Quick Test flow
 
-The terminal asks for a direction:
+The original predefined Quick Test asks for a direction:
 
 ```text
 1) A -> B
@@ -184,11 +229,11 @@ none+end
 random:1+complete
 ```
 
-See [`docs/SIMULATION_GUIDE.md`](docs/SIMULATION_GUIDE.md) for exact sequence behavior and JSON equivalents.
+See [`docs/SIMULATION_GUIDE.md`](docs/SIMULATION_GUIDE.md) for exact predefined sequence behavior and JSON equivalents.
 
 ## Three independent processes
 
-The simulator intentionally runs three programs:
+Both simulator styles use three programs:
 
 ```text
 Terminal 1: Simulation Control / Monitor Panel
@@ -201,6 +246,32 @@ The panel is the simulated shared medium. It performs arbitration and deliberate
 Tian Software A and B each execute their own queue, sender session, receive sessions, NACK handling, timeout behavior, payload processing, and packet trace.
 
 The processes communicate over localhost TCP for simulation only. Encoded LoRe frames are base64-wrapped inside newline-delimited JSON messages between the Tian processes and the panel. This simulation IPC is separate from the future ESP32 serial framing.
+
+## Live mode in one picture
+
+```text
+node_a_example.json                 node_b_example.json
+       |                                   |
+       v                                   v
++--------------+                    +--------------+
+| Tian A       |                    | Tian B       |
+| + keyboard   |                    | + keyboard   |
++--------------+                    +--------------+
+       |                                   |
+       +---------------+ +-----------------+
+                       | |
+                       v v
+                 +-------------+
+                 |   PANEL     |
+                 | contention  |
+                 | packet loss |
+                 +-------------+
+                       ^
+                       |
+               live_channel.json
+```
+
+**A's JSON controls A, B's JSON controls B, and the panel JSON controls the simulated radio channel between them.**
 
 ## Current LoRe frame summary
 
@@ -294,19 +365,20 @@ This branch is a strong simulation/reference stage, but it is not yet the final 
 
 - The AES-GCM key in `tian_payload.py` is a fixed demo/test key. It is not production key management.
 - Image mode deliberately converts images to a reduced JPEG; it does not preserve original PNG bytes.
-- `ContentType.BINARY` exists in the protocol, but Quick Test currently exposes Text and Image only.
+- `ContentType.BINARY` exists in the protocol, but current terminal UI exposes Text and Image only.
 - The simulation panel is a centralized medium/arbitrator. Real LoRa channel sensing/CAD is not implemented yet.
 - Randomized arbitration does not guarantee strict fairness.
-- Scenario sequences are consumed globally in chronological TX-window order, including when both A and B send; they are not separate per node unless the scenario is designed that way.
+- Panel loss sequences are consumed globally in chronological TX-window order, including when both A and B send.
+- Node scenarios are independent per Tian process, but channel sequences are global to the panel.
 - The simulator currently injects DATA/END/NACK/COMPLETE loss. Duplicate, reordering, bit-corruption, and latency injection are not exposed in the current scenario UI.
-- CRC validation exists, but the live `simulation/node_process.py` path does not yet contain a hardened catch-and-discard loop for arbitrary malformed radio frames; that should be added before treating real RF corruption as production-safe behavior.
+- CRC validation exists, but real RF corruption still needs hardened handling before production hardware use.
 - The frame contains a source ID but no destination ID, so the present design is best understood as a two-party link.
 
 ## Source-file guide
 
 ```text
 lore_sim.py
-  terminal Quick Test / JSON launcher
+  main menu: predefined + live launcher
 
 tian_payload.py
   text/image timestamping, image processing, AES-GCM encode/decode
@@ -322,19 +394,32 @@ serial_transport.py
   future Tian Software <-> ESP32 length-prefixed serial envelope
 
 simulation/panel.py
-  shared-medium simulator, contention and loss injection
+  shared-medium simulator, contention and loss injection; --live mode
 
 simulation/node_process.py
-  one independently running Tian Software process for A or B
+  predefined-simulation Tian process
+
+simulation/interactive_node.py
+  live Tian process, keyboard commands, per-node scenario player
 
 simulation/launch_three_terminals.py
-  opens panel + A + B in separate terminal windows
+  opens predefined panel + A + B
 
-simulation/scenarios/
-  saved JSON fault scenarios
+simulation/launch_live_terminals.py
+  opens live panel + interactive A + interactive B
+
+simulation/scenarios/node_a_example.json
+  example application actions for Tian A
+
+simulation/scenarios/node_b_example.json
+  example application actions for Tian B
+
+simulation/scenarios/live_channel.json
+  default clean live shared-medium configuration
 
 tests/
   protocol, serial, dynamic Tian Software, and payload tests
 ```
 
-For a complete explanation of how these pieces interact, continue with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+For the new live workflow continue with [`docs/LIVE_SIMULATION.md`](docs/LIVE_SIMULATION.md).
+For deeper system design continue with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
