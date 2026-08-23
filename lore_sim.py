@@ -85,18 +85,36 @@ def launch(path: Path) -> None:
     subprocess.run([sys.executable,str(ROOT/'simulation'/'launch_three_terminals.py'),'--scenario',str(path)],check=True)
 
 
+def ask_node_delay(node: str) -> str:
+    print(f"\nScenario playback speed for Tian {node}:")
+    print("  normal    = +0 seconds between scripted actions; uses JSON delays exactly")
+    print("  slow      = +2 seconds between scripted actions; easy to follow by eye")
+    print("  very-slow = +5 seconds between scripted actions; best for demos/debugging")
+    print("  number    = custom extra seconds, for example 1.5")
+    return ask(f"{node} pacing", "normal")
+
+
 def launch_live() -> None:
     print("\n=== LIVE INTERACTIVE TWO-TIAN SIMULATION ===")
     print("Three terminals will open: Channel Panel, Tian A, Tian B.")
     print("Both Tian terminals accept normal text and /image <path> live.")
     print("Each Tian terminal can also load its own node scenario with /load <file.json>.")
+    print("Each node also has independent scenario pacing with /delay.")
     print("\nOptional startup node scenarios:")
     a_raw=ask("A scenario path (Enter = manual only)","")
     b_raw=ask("B scenario path (Enter = manual only)","")
+    a_delay=ask_node_delay("A") if a_raw else "normal"
+    b_delay=ask_node_delay("B") if b_raw else "normal"
     autorun=False
     if a_raw or b_raw:
         autorun=ask("Autorun loaded scenario(s)? y/n","n").lower().startswith('y')
-    command=[sys.executable,str(ROOT/'simulation'/'launch_live_terminals.py'),'--panel-scenario',str(LIVE_CHANNEL_SCENARIO)]
+    command=[
+        sys.executable,
+        str(ROOT/'simulation'/'launch_live_terminals.py'),
+        '--panel-scenario',str(LIVE_CHANNEL_SCENARIO),
+        '--a-delay',a_delay,
+        '--b-delay',b_delay,
+    ]
     if a_raw: command += ['--a-scenario',str(Path(a_raw).expanduser().resolve())]
     if b_raw: command += ['--b-scenario',str(Path(b_raw).expanduser().resolve())]
     if autorun: command += ['--autorun']
