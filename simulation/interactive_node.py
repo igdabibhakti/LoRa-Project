@@ -20,10 +20,16 @@ from tian_software import TianSoftware
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DELAY_PRESETS = {
+SCENARIO_PACING_PRESETS = {
     "normal": 0.0,
     "slow": 2.0,
     "very-slow": 5.0,
+}
+
+TX_FRAME_DELAY_PRESETS = {
+    "normal": 0.0,
+    "slow": 0.25,
+    "very-slow": 1.0,
 }
 
 
@@ -37,19 +43,27 @@ def desc(frame: Frame) -> str:
     return "COMPLETE"
 
 
-def parse_scenario_delay(raw: str) -> tuple[str, float]:
+def _parse_delay(raw: str, presets: dict[str, float], label: str) -> tuple[str, float]:
     value = raw.strip().lower().replace("_", "-")
-    if value in DELAY_PRESETS:
-        return value, DELAY_PRESETS[value]
+    if value in presets:
+        return value, presets[value]
     try:
         seconds = float(value)
     except ValueError as exc:
         raise ValueError(
-            "delay must be normal, slow, very-slow, or a non-negative number of seconds"
+            f"{label} must be normal, slow, very-slow, or a non-negative number of seconds"
         ) from exc
     if seconds < 0:
-        raise ValueError("delay seconds cannot be negative")
+        raise ValueError(f"{label} seconds cannot be negative")
     return f"custom-{seconds:g}s", seconds
+
+
+def parse_scenario_pacing(raw: str) -> tuple[str, float]:
+    return _parse_delay(raw, SCENARIO_PACING_PRESETS, "scenario pacing")
+
+
+def parse_tx_frame_delay(raw: str) -> tuple[str, float]:
+    return _parse_delay(raw, TX_FRAME_DELAY_PRESETS, "packet delay")
 
 
 class ScenarioPlayer:
@@ -66,22 +80,23 @@ class ScenarioPlayer:
         self.extra_delay = 0.0
 
     def set_delay(self, raw: str | float | int | None = None) -> None:
+        """Set scenario ACTION pacing. User-facing command is /pacing."""
         if raw is None:
-            print(f"[DELAY] {self.delay_name} = +{self.extra_delay:g}s between scripted actions", flush=True)
-            print("[DELAY] normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s", flush=True)
+            print(
+                f"[PACING] {self.delay_name} = +{self.extra_delay:g}s between scripted actions",
+                flush=True,
+            )
+            print(
+                "[PACING] normal=+0s, slow=+2s, very-slow=+5s, /pacing 1.5=+1.5s",
+                flush=True,
+            )
             return
-        name, seconds = parse_scenario_delay(str(raw))
+        name, seconds = parse_scenario_pacing(str(raw))
         self.delay_name = name
         self.extra_delay = seconds
         if self.config:
             self.config["pacing"] = seconds if name.startswith("custom-") else name
-        print(f"[DELAY] set to {name}: +{seconds:g}s between scripted actions", flush=True)
-        if seconds == 0:
-            print("[DELAY] NORMAL: scenario uses only each action's own delay.", flush=True)
-        elif seconds <= 2:
-            print("[DELAY] SLOW: easier to watch the sequence and packet logs.", flush=True)
-        else:
-            print("[DELAY] VERY SLOW: good for demos, teaching, and debugging.", flush=True)
+        print(f"[PACING] set to {name}: +{seconds:g}s between scripted actions", flush=True)
 
     def load(self, raw_path: str | Path, apply_saved_pacing: bool = True) -> None:
         path, cfg = self.node.scenario_store.load(raw_path)
@@ -93,11 +108,17 @@ class ScenarioPlayer:
         if apply_saved_pacing and "pacing" in cfg:
             self.set_delay(cfg["pacing"])
         print(f"[SCENARIO] loaded {len(self.actions)} actions from {path}", flush=True)
-        print(f"[SCENARIO] pacing={self.delay_name} (+{self.extra_delay:g}s between actions)", flush=True)
+        print(
+            f"[SCENARIO] action pacing={self.delay_name} (+{self.extra_delay:g}s between actions)",
+            flush=True,
+        )
 
     def run(self) -> None:
         if not self.actions:
-            print("[SCENARIO] nothing loaded; use /scenario list, /scenario select, or /scenario make", flush=True)
+            print(
+                "[SCENARIO] nothing loaded; use /scenario list, /scenario select, or /scenario make",
+                flush=True,
+            )
             return
         if self.thread and self.thread.is_alive():
             print("[SCENARIO] already running", flush=True)
@@ -108,7 +129,10 @@ class ScenarioPlayer:
         self.pause_event.clear()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        print(f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)} pacing={self.delay_name}", flush=True)
+        print(
+            f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)} pacing={self.delay_name}",
+            flush=True,
+        )
 
     def _worker(self) -> None:
         while self.index < len(self.actions) and not self.stop_event.is_set():
@@ -171,7 +195,7 @@ class ScenarioPlayer:
             state = "paused"
         print(
             f"[SCENARIO] state={state} file={self.path or '-'} progress={self.index}/{len(self.actions)} "
-            f"pacing={self.delay_name} extra_delay=+{self.extra_delay:g}s",
+            f"pacing={self.delay_name} extra_action_delay=+{self.extra_delay:g}s",
             flush=True,
         )
 
@@ -199,6 +223,30 @@ class InteractiveNode:
         self.pending_encode_traces: list[dict] = []
         self.current_encode_trace: dict | None = None
         self.tx_round = 0
+        self.tx_delay_name = "normal"
+        self.tx_frame_delay = 0.0
+
+    def set_tx_delay(self, raw: str | None = None) -> None:
+        if raw is None:
+            print(
+                f"[TX DELAY] {self.tx_delay_name} = {self.tx_frame_delay:g}s between protocol frames",
+                flush=True,
+            )
+            print("[TX DELAY] normal=0s, slow=0.25s, very-slow=1s, /delay 0.5=0.5s", flush=True)
+            return
+        name, seconds = parse_tx_frame_delay(raw)
+        self.tx_delay_name = name
+        self.tx_frame_delay = seconds
+        print(
+            f"[TX DELAY] set to {name}: {seconds:g}s between DATA/END/NACK/COMPLETE frames",
+            flush=True,
+        )
+        if seconds == 0:
+            print("[TX DELAY] NORMAL: frames are emitted as fast as the simulator can send them.", flush=True)
+        elif seconds <= 0.25:
+            print("[TX DELAY] SLOW: individual packets should now be easy to see in the terminal.", flush=True)
+        else:
+            print("[TX DELAY] VERY SLOW/CUSTOM: intended for close observation and demos.", flush=True)
 
     def report_encode(self, prepared) -> None:
         trace = dict(prepared.trace)
@@ -211,7 +259,8 @@ class InteractiveNode:
         self.report_encode(prepared)
         self.tian.queue_message(prepared.encrypted, ContentType.TEXT, "interactive-text")
         print(
-            f"[QUEUE] TEXT {text!r} bytes={prepared.original_size} processed={prepared.processed_size}B depth={len(self.tian.outgoing)}",
+            f"[QUEUE] TEXT {text!r} bytes={prepared.original_size} processed={prepared.processed_size}B "
+            f"depth={len(self.tian.outgoing)}",
             flush=True,
         )
         self.request_channel_if_needed()
@@ -265,6 +314,8 @@ class InteractiveNode:
                 "/resume": "resume",
                 "/stop": "stop",
                 "/delay": "delay",
+                "/pacing": "pacing",
+                "/scenario-delay": "pacing",
                 "/scenario": "scenario",
                 "/protocol": "scenario",
                 "/status": "status",
@@ -326,17 +377,30 @@ class InteractiveNode:
                     self.scenario.preview()
                 else:
                     print("Usage: /load <node-scenario.json>", flush=True)
-            elif command == "run": self.scenario.run()
-            elif command == "pause": self.scenario.pause()
-            elif command == "resume": self.scenario.resume()
+            elif command == "run":
+                self.scenario.run()
+            elif command == "pause":
+                self.scenario.pause()
+            elif command == "resume":
+                self.scenario.resume()
             elif command == "stop":
-                self.scenario.stop(); print("[SCENARIO] stopped", flush=True)
-            elif command == "delay": self.scenario.set_delay(argument)
-            elif command == "scenario": self.scenario_command(argument)
+                self.scenario.stop()
+                print("[SCENARIO] stopped", flush=True)
+            elif command == "delay":
+                self.set_tx_delay(argument)
+            elif command == "pacing":
+                self.scenario.set_delay(argument)
+            elif command == "scenario":
+                self.scenario_command(argument)
             elif command == "status":
                 print(
                     f"[STATUS] pending={self.tian.has_pending} outbound_busy={self.tian.outbound_busy} "
-                    f"queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}", flush=True,
+                    f"queue_depth={len(self.tian.outgoing)} channel_requested={self.requested}",
+                    flush=True,
+                )
+                print(
+                    f"[STATUS] tx_delay={self.tx_delay_name} ({self.tx_frame_delay:g}s between frames)",
+                    flush=True,
                 )
                 self.scenario.status()
             elif command == "help":
@@ -344,6 +408,14 @@ class InteractiveNode:
                     "Commands:\n"
                     "  normal text                   send text + show encoding/transmission detail\n"
                     "  /image <path>                 send image + show codec/transmission detail\n"
+                    "  /delay                        show REAL packet/frame transmission delay\n"
+                    "  /delay normal                 0s between DATA/END/NACK/COMPLETE frames\n"
+                    "  /delay slow                   0.25s between frames; easy to watch\n"
+                    "  /delay very-slow              1s between frames; demo/debug speed\n"
+                    "  /delay 0.5                    custom 0.5s between frames\n"
+                    "  /pacing normal                +0s between scenario actions\n"
+                    "  /pacing slow                  +2s between scenario actions\n"
+                    "  /pacing very-slow             +5s between scenario actions\n"
                     "  /scenario list               list saved node scenarios\n"
                     "  /scenario select <n/name>    select + preview + preload an old scenario\n"
                     "  /scenario preview            preview currently loaded scenario\n"
@@ -352,16 +424,13 @@ class InteractiveNode:
                     "  /load <file.json>             direct-path preload (power-user shortcut)\n"
                     "  /run                          run loaded scenario\n"
                     "  /pause /resume /stop          control scenario playback\n"
-                    "  /delay normal                 +0s extra between scripted actions\n"
-                    "  /delay slow                   +2s extra between scripted actions\n"
-                    "  /delay very-slow              +5s extra between scripted actions\n"
-                    "  /delay 1.5                    custom +1.5s extra between actions\n"
-                    "  /status                       node + scenario status\n"
+                    "  /status                       node + TX delay + scenario status\n"
                     "  /help                         show commands\n"
                     "  /quit                         exit this Tian terminal",
                     flush=True,
                 )
-            elif command == "quit": self.running = False
+            elif command == "quit":
+                self.running = False
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[ERROR] {exc}", flush=True)
 
@@ -369,12 +438,26 @@ class InteractiveNode:
         if not frames:
             return
         summary = transfer_summary(frames)
+        summary["tx_delay_name"] = self.tx_delay_name
+        summary["inter_frame_delay_ms"] = round(self.tx_frame_delay * 1000, 3)
         print_transfer_summary(summary, title)
-        send_json(self.sock, {"type": "TRACE", "node": self.name, "stage": "TX_WINDOW", "trace": summary})
-        for raw in frames:
+        send_json(
+            self.sock,
+            {"type": "TRACE", "node": self.name, "stage": "TX_WINDOW", "trace": summary},
+        )
+        if self.tx_frame_delay > 0 and len(frames) > 1:
+            print(
+                f"[TX PACING] {self.tx_delay_name}: waiting {self.tx_frame_delay:g}s between "
+                f"{len(frames)} protocol frames",
+                flush=True,
+            )
+        for index, raw in enumerate(frames):
+            if index > 0 and self.tx_frame_delay > 0:
+                time.sleep(self.tx_frame_delay)
             frame = Frame.decode(raw)
             print(
-                f"[TX] {desc(frame)} message_id=0x{frame.message_id:08X} content={frame.content_type.name} frame_bytes={len(raw)}",
+                f"[TX] {desc(frame)} message_id=0x{frame.message_id:08X} "
+                f"content={frame.content_type.name} frame_bytes={len(raw)}",
                 flush=True,
             )
             send_json(self.sock, {"type": "FRAME", "node": self.name, "data": b64e(raw)})
@@ -385,21 +468,32 @@ class InteractiveNode:
             self.requested = False
             print(f"[CHANNEL] GRANTED backoff={message.get('backoff_ms')}ms", flush=True)
             frames = self.tian.begin_next_transfer()
-            self.current_encode_trace = self.pending_encode_traces.pop(0) if self.pending_encode_traces else None
+            self.current_encode_trace = (
+                self.pending_encode_traces.pop(0) if self.pending_encode_traces else None
+            )
             self.tx_round = 0
             self.send_frames_with_detail(frames, "INITIAL TRANSMISSION")
             self.last_tx = time.monotonic()
         elif typ == "FRAME":
             raw = b64d(message["data"])
             frame = Frame.decode(raw)
+            # Any valid response/activity resets the sender timeout clock. This is
+            # especially important when experiment pacing intentionally slows
+            # multi-frame NACK/response windows.
+            self.last_tx = time.monotonic()
             print(
-                f"[RX] {desc(frame)} message_id=0x{frame.message_id:08X} content={frame.content_type.name} frame_bytes={len(raw)}",
+                f"[RX] {desc(frame)} message_id=0x{frame.message_id:08X} "
+                f"content={frame.content_type.name} frame_bytes={len(raw)}",
                 flush=True,
             )
             responses = self.tian.handle_encoded_frame(raw)
             if responses:
                 self.tx_round += 1
-                title = "PROTOCOL RESPONSE" if frame.frame_type != FrameType.NACK else f"SELECTIVE RETRANSMISSION ROUND {self.tx_round}"
+                title = (
+                    "PROTOCOL RESPONSE"
+                    if frame.frame_type != FrameType.NACK
+                    else f"SELECTIVE RETRANSMISSION ROUND {self.tx_round}"
+                )
                 self.send_frames_with_detail(responses, title)
                 self.last_tx = time.monotonic()
             for received in self.tian.pop_received_messages():
@@ -407,12 +501,19 @@ class InteractiveNode:
                     received.payload,
                     received.content_type,
                     output_dir=ROOT / "received",
-                    output_stem=f"node_{self.name}_from_{received.source_node_id}_{received.message_id:08X}",
+                    output_stem=(
+                        f"node_{self.name}_from_{received.source_node_id}_{received.message_id:08X}"
+                    ),
                 )
                 print_trace_block("TIAN DECODING PROCESS", decoded.get("trace", {}))
                 send_json(
                     self.sock,
-                    {"type": "TRACE", "node": self.name, "stage": "DECODE", "trace": decoded.get("trace", {})},
+                    {
+                        "type": "TRACE",
+                        "node": self.name,
+                        "stage": "DECODE",
+                        "trace": decoded.get("trace", {}),
+                    },
                 )
                 print(
                     f"[EXPERIMENT] RECEIVE COMPLETE message_id=0x{received.message_id:08X} "
@@ -420,7 +521,10 @@ class InteractiveNode:
                     flush=True,
                 )
                 if decoded["type"] == "text":
-                    print(f"\n[MESSAGE] TEXT from={received.source_node_id}: {decoded['text']}\n", flush=True)
+                    print(
+                        f"\n[MESSAGE] TEXT from={received.source_node_id}: {decoded['text']}\n",
+                        flush=True,
+                    )
                 elif decoded["type"] == "image":
                     print(
                         f"\n[MESSAGE] IMAGE from={received.source_node_id} saved={decoded['path']} "
@@ -429,7 +533,8 @@ class InteractiveNode:
                     )
             if frame.frame_type == FrameType.COMPLETE and not self.tian.outbound_busy:
                 print(
-                    f"[TRANSFER] COMPLETE message_id=0x{frame.message_id:08X}; reliable transaction finished",
+                    f"[TRANSFER] COMPLETE message_id=0x{frame.message_id:08X}; "
+                    "reliable transaction finished",
                     flush=True,
                 )
                 self.current_encode_trace = None
@@ -437,36 +542,73 @@ class InteractiveNode:
         elif typ == "STOP":
             self.running = False
 
-    def run(self, startup_scenario: str | None = None, autorun: bool = False, startup_delay: str | None = None) -> None:
+    def run(
+        self,
+        startup_scenario: str | None = None,
+        autorun: bool = False,
+        startup_tx_delay: str | None = None,
+        startup_pacing: str | None = None,
+    ) -> None:
         print(f"=== LIVE TIAN SOFTWARE {self.name} (node_id={self.node_id}) ===", flush=True)
         print("Normal text sends live. Type /help for commands.", flush=True)
-        print("EXPERIMENT VIEW is enabled: encode, packet/frame, retransmission, and decode details are shown.", flush=True)
-        print("Node scenarios can be CREATED, PREVIEWED, SAVED, and SELECTED entirely in this terminal.", flush=True)
+        print(
+            "EXPERIMENT VIEW is enabled: encode, packet/frame, retransmission, and decode details are shown.",
+            flush=True,
+        )
+        print(
+            "REAL TX packet delay: /delay normal=0s, slow=0.25s, very-slow=1s between frames.",
+            flush=True,
+        )
+        print(
+            "Scenario-message pacing is separate: /pacing normal=0s, slow=+2s, very-slow=+5s.",
+            flush=True,
+        )
+        print(
+            "Node scenarios can be CREATED, PREVIEWED, SAVED, and SELECTED entirely in this terminal.",
+            flush=True,
+        )
         print("Start with /scenario list or /scenario make.", flush=True)
-        print("Scenario pacing: normal=+0s, slow=+2s, very-slow=+5s.", flush=True)
+
         if startup_scenario:
-            try: self.scenario.load(startup_scenario)
-            except Exception as exc: print(f"[ERROR] startup scenario: {exc}", flush=True)
-        if startup_delay is not None:
-            try: self.scenario.set_delay(startup_delay)
-            except ValueError as exc: print(f"[ERROR] startup delay: {exc}; keeping scenario/default pacing", flush=True)
+            try:
+                self.scenario.load(startup_scenario)
+            except Exception as exc:
+                print(f"[ERROR] startup scenario: {exc}", flush=True)
+        if startup_pacing is not None:
+            try:
+                self.scenario.set_delay(startup_pacing)
+            except ValueError as exc:
+                print(
+                    f"[ERROR] startup scenario pacing: {exc}; keeping scenario/default pacing",
+                    flush=True,
+                )
+        if startup_tx_delay is not None:
+            try:
+                self.set_tx_delay(startup_tx_delay)
+            except ValueError as exc:
+                print(f"[ERROR] startup TX delay: {exc}; using normal", flush=True)
         if autorun and self.scenario.actions:
             self.scenario.run()
+
         threading.Thread(target=self.stdin_worker, daemon=True).start()
         buffer = b""
         while self.running:
             while True:
-                try: command, argument = self.command_queue.get_nowait()
-                except queue.Empty: break
+                try:
+                    command, argument = self.command_queue.get_nowait()
+                except queue.Empty:
+                    break
                 self.handle_command(command, argument)
             self.request_channel_if_needed()
             self.sock.settimeout(0.05)
             try:
                 messages, buffer, ok = recv_lines(self.sock, buffer)
             except socket.timeout:
-                messages = []; ok = True
+                messages = []
+                ok = True
             if not ok:
-                print("[CONNECTION] panel disconnected", flush=True); break
+                print("[CONNECTION] panel disconnected", flush=True)
+                break
             for message in messages:
                 self.handle_message(message)
             if self.tian.outbound_busy and time.monotonic() - self.last_tx >= self.timeout:
@@ -477,8 +619,10 @@ class InteractiveNode:
                     self.send_frames_with_detail(retry, f"TIMEOUT RETRY ROUND {self.tx_round}")
                     self.last_tx = time.monotonic()
         self.scenario.stop()
-        try: self.sock.close()
-        except OSError: pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 def main() -> None:
@@ -490,9 +634,21 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=1.2)
     parser.add_argument("--scenario", help="optional node scenario JSON to preload")
     parser.add_argument("--autorun", action="store_true", help="start preloaded scenario immediately")
-    parser.add_argument("--delay", help="override scenario pacing: normal, slow, very-slow, or custom seconds")
+    parser.add_argument(
+        "--delay",
+        help="REAL inter-frame TX delay: normal, slow, very-slow, or custom seconds",
+    )
+    parser.add_argument(
+        "--pacing",
+        help="scenario action pacing override: normal, slow, very-slow, or custom seconds",
+    )
     args = parser.parse_args()
-    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(args.scenario, args.autorun, args.delay)
+    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(
+        args.scenario,
+        args.autorun,
+        args.delay,
+        args.pacing,
+    )
 
 
 if __name__ == "__main__":
