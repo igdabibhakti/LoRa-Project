@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Terminal-first launcher and scenario editor for LoRe/Tian simulation."""
+"""Easy terminal launcher for LoRe/Tian Software simulation.
+
+Quick mode is intentionally short. Example loss sequence line:
+
+    1,2,5 | 2,5 | random:2 | 20% | none+nack
+
+Each pipe-separated item is one TX/retransmission sequence.
+"""
 from __future__ import annotations
 
 import json
@@ -10,15 +17,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SCENARIO_DIR = ROOT / "simulation" / "scenarios"
 DEFAULT_SCENARIO = SCENARIO_DIR / "example.json"
+QUICK_SCENARIO = SCENARIO_DIR / "quick_last.json"
 
 
-def ask(prompt: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
+def ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
     value = input(f"{prompt}{suffix}: ").strip()
-    return value if value else (default or "")
+    return value if value else default
 
 
-def ask_int(prompt: str, default: int, minimum: int = 0) -> int:
+def ask_int(prompt: str, default: int, minimum: int = 1) -> int:
     while True:
         raw = ask(prompt, str(default))
         try:
@@ -27,141 +35,208 @@ def ask_int(prompt: str, default: int, minimum: int = 0) -> int:
                 raise ValueError
             return value
         except ValueError:
-            print(f"Enter an integer >= {minimum}.")
+            print(f"Please enter a whole number >= {minimum}.")
 
 
-def ask_float(prompt: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    while True:
-        raw = ask(prompt, str(default))
-        try:
-            value = float(raw)
-            if not minimum <= value <= maximum:
-                raise ValueError
-            return value
-        except ValueError:
-            print(f"Enter a value from {minimum} to {maximum}.")
+def repeat_to_size(text: str, size: int) -> str:
+    if not text:
+        text = "TEST"
+    encoded = text.encode("utf-8")
+    if len(encoded) >= size:
+        return encoded[:size].decode("utf-8", errors="ignore")
+    parts: list[str] = []
+    total = 0
+    while total < size:
+        parts.append(text)
+        parts.append(" ")
+        total += len(encoded) + 1
+    return "".join(parts).encode("utf-8")[:size].decode("utf-8", errors="ignore")
 
 
-def ask_bool(prompt: str, default: bool = False) -> bool:
-    d = "y" if default else "n"
-    while True:
-        raw = ask(f"{prompt} (y/n)", d).lower()
-        if raw in {"y", "yes"}: return True
-        if raw in {"n", "no"}: return False
-        print("Enter y or n.")
-
-
-def parse_indexes(raw: str) -> list[int]:
-    if not raw.strip(): return []
-    result = []
-    for part in raw.split(","):
+def parse_manual_indexes(token: str) -> list[int]:
+    if not token.strip():
+        return []
+    indexes: list[int] = []
+    for part in token.split(","):
         part = part.strip()
-        if not part: continue
+        if not part:
+            continue
         value = int(part)
-        if value < 0: raise ValueError("packet indexes cannot be negative")
-        result.append(value)
-    return sorted(set(result))
+        if value < 0:
+            raise ValueError("packet indexes cannot be negative")
+        indexes.append(value)
+    return sorted(set(indexes))
 
 
-def build_sequence(number: int) -> dict:
-    print(f"\n--- Configure Sequence {number} ---")
-    name = ask("Sequence name", f"sequence-{number}")
-    print("DATA loss mode:\n  1) none\n  2) manual packet indexes\n  3) random exact count\n  4) random probability")
-    mode_choice = ask("Choose", "1")
-    if mode_choice == "2":
-        while True:
-            try:
-                indexes = parse_indexes(ask("Indexes to drop, comma-separated (e.g. 1,2,5)", "")); break
-            except ValueError as exc: print(f"Invalid indexes: {exc}")
-        data_loss = {"mode": "manual", "indexes": indexes}
-    elif mode_choice == "3":
-        data_loss = {"mode": "random_count", "count": ask_int("How many DATA packets to randomly drop", 1)}
-    elif mode_choice == "4":
-        data_loss = {"mode": "random_probability", "probability": ask_float("Loss probability (0.0-1.0)", 0.20)}
-    else:
+def parse_sequence_token(token: str, number: int) -> dict:
+    pieces = [p.strip().lower() for p in token.split("+") if p.strip()]
+    data_part = pieces[0] if pieces else "none"
+    flags = set(pieces[1:])
+
+    if data_part in {"", "none", "clean", "0"}:
         data_loss = {"mode": "none"}
-    seq = {"name": name, "data_loss": data_loss}
-    if ask_bool("Drop END in this sequence", False): seq["drop_end"] = True
-    if ask_bool("Drop NACK in this sequence", False): seq["drop_nack"] = True
-    if ask_bool("Drop COMPLETE in this sequence", False): seq["drop_complete"] = True
+    elif data_part.startswith("random:"):
+        count = int(data_part.split(":", 1)[1])
+        if count < 0:
+            raise ValueError("random count cannot be negative")
+        data_loss = {"mode": "random_count", "count": count}
+    elif data_part.endswith("%"):
+        percent = float(data_part[:-1])
+        if not 0 <= percent <= 100:
+            raise ValueError("percentage must be between 0% and 100%")
+        data_loss = {"mode": "random_probability", "probability": percent / 100.0}
+    else:
+        data_loss = {"mode": "manual", "indexes": parse_manual_indexes(data_part)}
+
+    unknown = flags - {"end", "nack", "complete"}
+    if unknown:
+        raise ValueError(f"unknown fault flag(s): {', '.join(sorted(unknown))}")
+
+    seq = {"name": f"sequence-{number}", "data_loss": data_loss}
+    if "end" in flags:
+        seq["drop_end"] = True
+    if "nack" in flags:
+        seq["drop_nack"] = True
+    if "complete" in flags:
+        seq["drop_complete"] = True
     return seq
 
 
-def create_scenario() -> Path:
-    print("\n=== CREATE SIMULATION SCENARIO ===")
-    seed_raw = ask("Random seed (blank = new randomness every run)", "")
-    seed = int(seed_raw) if seed_raw else None
-    cfg = {"seed": seed, "contention_window_ms": ask_int("Contention window ms", 80, 1), "max_backoff_ms": ask_int("Maximum randomized backoff ms", 120, 5), "messages": [], "sequences": []}
-    print("\nAdd messages. Add at least one for A or B.")
-    nmsg = ask_int("Number of queued messages", 2, 1)
-    for i in range(1, nmsg + 1):
-        sender = ask(f"Message {i} sender (A/B)", "A" if i % 2 else "B").upper()
-        while sender not in {"A", "B"}: sender = ask("Sender must be A or B").upper()
-        label = ask("Label", f"message-{i}")
-        text = ask("Text payload", sender * 600)
-        cfg["messages"].append({"sender": sender, "label": label, "text": text})
-    print("\nAdd as many transmission/retransmission sequences as you want.")
-    i = 1
-    while True:
-        cfg["sequences"].append(build_sequence(i)); i += 1
-        if not ask_bool("Add another sequence", True): break
-    SCENARIO_DIR.mkdir(parents=True, exist_ok=True)
-    name = ask("Scenario filename", "terminal_scenario.json")
-    if not name.endswith(".json"): name += ".json"
-    path = SCENARIO_DIR / Path(name).name
-    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-    print(f"\nSaved: {path}")
-    return path
+def parse_sequence_line(raw: str) -> list[dict]:
+    tokens = [part.strip() for part in raw.split("|")]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return [{"name": "sequence-1", "data_loss": {"mode": "none"}}]
+    return [parse_sequence_token(token, i) for i, token in enumerate(tokens, 1)]
 
 
 def load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f: cfg = json.load(f)
+    with path.open("r", encoding="utf-8") as handle:
+        cfg = json.load(handle)
     if not isinstance(cfg.get("messages"), list) or not isinstance(cfg.get("sequences"), list):
         raise ValueError("scenario must contain messages[] and sequences[]")
     return cfg
 
 
-def print_scenario(path: Path) -> None:
-    cfg = load_json(path)
-    print(f"\n=== {path.name} ===")
-    print(json.dumps(cfg, indent=2))
-
-
 def launch(path: Path) -> None:
     load_json(path)
-    subprocess.run([sys.executable, str(ROOT / "simulation" / "launch_three_terminals.py"), "--scenario", str(path)], check=True)
+    subprocess.run(
+        [sys.executable, str(ROOT / "simulation" / "launch_three_terminals.py"), "--scenario", str(path)],
+        check=True,
+    )
 
 
-def select_existing() -> Path:
+def quick_test() -> Path:
+    print("\n=== QUICK TEST ===")
+    print("1) A -> B")
+    print("2) B -> A")
+    print("3) A and B both send (contention test)")
+    direction = ask("Choose", "1")
+    if direction not in {"1", "2", "3"}:
+        direction = "1"
+
+    payload_size = ask_int("Approx payload bytes (180 B = about 1 DATA packet)", 1200, 1)
+    messages = []
+
+    if direction in {"1", "3"}:
+        text_a = ask("A message", "Hello from A")
+        messages.append({"sender": "A", "label": "A-message", "text": repeat_to_size(text_a, payload_size)})
+    if direction in {"2", "3"}:
+        text_b = ask("B message", "Hello from B")
+        messages.append({"sender": "B", "label": "B-message", "text": repeat_to_size(text_b, payload_size)})
+
+    print("\nLoss sequence syntax:")
+    print("  manual packets : 1,2,5")
+    print("  random count   : random:2")
+    print("  probability    : 20%")
+    print("  no DATA loss   : none")
+    print("  control loss   : add +end, +nack, or +complete")
+    print("  next sequence  : separate with |")
+    print("Example: 1,2,5 | 2,5 | random:1 | 20% | none+nack")
+
+    while True:
+        raw_loss = ask("Loss sequences", "1,2,5 | 2,5 | none")
+        try:
+            sequences = parse_sequence_line(raw_loss)
+            break
+        except ValueError as exc:
+            print(f"Invalid sequence: {exc}")
+
+    seed_raw = ask("Random seed (Enter = random every run)", "")
+    seed = int(seed_raw) if seed_raw else None
+
+    cfg = {
+        "seed": seed,
+        "contention_window_ms": 80,
+        "max_backoff_ms": 120,
+        "messages": messages,
+        "sequences": sequences,
+    }
+    SCENARIO_DIR.mkdir(parents=True, exist_ok=True)
+    QUICK_SCENARIO.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+    print("\nReady.")
+    print(f"Messages      : {', '.join(m['sender'] for m in messages)}")
+    print(f"Payload       : ~{payload_size} bytes each")
+    print(f"Sequences     : {len(sequences)}")
+    print(f"Saved JSON    : {QUICK_SCENARIO}")
+    print("Launching Panel + Tian Software A + Tian Software B...\n")
+    return QUICK_SCENARIO
+
+
+def choose_json() -> Path:
     SCENARIO_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(SCENARIO_DIR.glob("*.json"))
     if files:
-        print("\nAvailable scenarios:")
-        for i, p in enumerate(files, 1): print(f"  {i}) {p.name}")
-        raw = ask("Choose number or enter a JSON path", "1")
-        if raw.isdigit() and 1 <= int(raw) <= len(files): return files[int(raw)-1]
+        print("\nSaved JSON scenarios:")
+        for i, path in enumerate(files, 1):
+            print(f"  {i}) {path.name}")
+        raw = ask("Choose number or type path", "1")
+        if raw.isdigit() and 1 <= int(raw) <= len(files):
+            return files[int(raw) - 1]
         return Path(raw).expanduser().resolve()
     return Path(ask("JSON scenario path")).expanduser().resolve()
 
 
+def show_json(path: Path) -> None:
+    cfg = load_json(path)
+    print(f"\n--- {path} ---")
+    print(json.dumps(cfg, indent=2))
+
+
 def main() -> None:
     while True:
-        print("\n========================================\n LoRe / Tian Software Terminal Simulator\n========================================")
-        print("1) Create scenario interactively + run\n2) Load existing JSON scenario + run\n3) Create scenario interactively only\n4) Review / validate a JSON scenario\n5) Run included example scenario\n6) Exit")
+        print("\n====================================")
+        print(" LoRe / Tian Software Simulator")
+        print("====================================")
+        print("1) QUICK TEST (recommended)")
+        print("2) Run saved JSON scenario")
+        print("3) View / validate JSON scenario")
+        print("4) Run included example")
+        print("5) Exit")
         choice = ask("Choose", "1")
         try:
             if choice == "1":
-                path = create_scenario(); print_scenario(path); launch(path); return
+                launch(quick_test())
+                return
             if choice == "2":
-                path = select_existing(); print_scenario(path); launch(path); return
+                path = choose_json()
+                show_json(path)
+                launch(path)
+                return
             if choice == "3":
-                path = create_scenario(); print_scenario(path); return
-            if choice == "4": print_scenario(select_existing()); continue
-            if choice == "5": print_scenario(DEFAULT_SCENARIO); launch(DEFAULT_SCENARIO); return
-            if choice == "6": return
+                show_json(choose_json())
+                continue
+            if choice == "4":
+                show_json(DEFAULT_SCENARIO)
+                launch(DEFAULT_SCENARIO)
+                return
+            if choice == "5":
+                return
             print("Unknown option.")
         except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
             print(f"ERROR: {exc}")
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
