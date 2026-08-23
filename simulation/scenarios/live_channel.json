@@ -1,0 +1,14 @@
+{
+  "seed": null,
+  "contention_window_ms": 80,
+  "max_backoff_ms": 120,
+  "messages": [],
+  "sequences": [
+    {
+      "name": "live-clean-default",
+      "data_loss": {
+        "mode": "none"
+      }
+    }
+  ]
+}
