@@ -1,0 +1,15 @@
+{
+  "name": "Example Tian node actions",
+  "actions": [
+    {
+      "delay": 0,
+      "type": "text",
+      "text": "Hello from loaded node scenario"
+    },
+    {
+      "delay": 2,
+      "type": "text",
+      "text": "This message is sent two seconds later"
+    }
+  ]
+}
