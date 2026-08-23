@@ -1,148 +1,198 @@
-# LoRe Project — Dynamic Tian Node Prototype
+# LoRe Project — Dynamic Both-Send Tian Software
 
-This branch builds on `feature/reliable-half-duplex-protocol` and turns Tian's
-protocol into a transport-independent node runtime. The same Tian instance can
-initiate reliable transfers and receive/reassemble transfers.
+This branch extends the reliable half-duplex protocol so **both Tian Software instances can queue and initiate messages**, while only one transfer owns the shared radio channel at a time.
 
-## What is implemented
-
-- Reliable binary framing with CRC-16.
-- `DATA`, `END`, `NACK`, and `COMPLETE` frames.
-- Selective retransmission of missing DATA packets.
-- Recovery from lost DATA, lost END, and lost response windows.
-- `TianNode`, which can both send and receive using the same code.
-- Independent receive sessions keyed by `(source_node_id, message_id)`.
-- A 2-byte big-endian serial envelope for transporting encoded LoRe frames.
-- An interactive serial-node runtime with packet tracing and response timeout
-  handling.
-- Tests for A->B, B->A, packet loss/NACK, lost END, lost COMPLETE, and serial
-  framing.
+Tian Software remains responsible for message/protocol work. The ESP32 remains a future transport/radio bridge.
 
 ## Architecture
 
 ```text
-Tian application
-      |
-      v
-TianNode
-  - SenderSession
-  - ReceiveSession(s)
-  - DATA/END/NACK/COMPLETE
-      |
-      v
-encoded LoRe Frame bytes
-      |
-      v
-FramedSerialTransport
-      |
-      v
-USB serial / future ESP32 bridge
+User/Application
+  -> Tian Software
+     - encode/decode
+     - packetize/reassemble
+     - DATA / END / NACK / COMPLETE
+     - CRC validation
+     - retransmission
+     - outgoing queue
+     - channel-request state
+  -> serial_transport.py
+     - [2-byte big-endian length][encoded LoRe frame]
+  -> ESP32 USB serial bridge
+  -> LoRa module TX/RX (half duplex)
+  -> RF
+  -> LoRa module
+  -> ESP32 bridge
+  -> serial_transport.py
+  -> Tian Software
+  -> User/Application
 ```
 
-The ESP32 does not need to understand images, encryption, reassembly, missing
-packet decisions, or NACK generation. It only needs to move complete encoded
-LoRe frames and later control the LoRa radio TX/RX state.
+The simulator replaces only the ESP32/LoRa middle transport. The two Tian Software instances still run as independent programs.
 
-## Radio frame v1
+## Channel arbitration
 
-All integers use network byte order (big-endian).
+Both sides may have queued messages. If A and B request an idle channel together, the simulation panel gives each a randomized contention backoff. The smallest backoff acquires the channel; the other remains queued.
 
-| Field | Bytes | Meaning |
-|---|---:|---|
-| Magic | 2 | `0xAA55` |
-| Version | 1 | Protocol version (`1`) |
-| Frame type | 1 | DATA/END/NACK/COMPLETE |
-| Content type | 1 | Text/image/binary |
-| Source node ID | 2 | Physical node identity |
-| Message ID | 4 | Groups all packets from one message |
-| Total/page count | 2 | DATA total, END expected total, or NACK page count |
-| Packet/page index | 2 | DATA index, retry round, or NACK page index |
-| Payload length | 1 | `0..180` |
-| Payload | 0–180 | Message chunk or NACK indexes |
-| CRC-16 | 2 | CRC-16/CCITT-FALSE over header + payload |
-
-Maximum DATA frame: 198 bytes.
-
-## Serial envelope
-
-Serial transport adds a transport-only length prefix around each encoded LoRe
-frame:
+The current owner keeps the channel for the whole reliable transaction:
 
 ```text
-+----------------------+-------------------------+
-| uint16 frame length  | encoded LoRe Frame      |
-| big-endian, 2 bytes  | frame_length bytes      |
-+----------------------+-------------------------+
+DATA... -> END -> NACK -> retransmit -> END -> COMPLETE
 ```
 
-The prefix is not part of the radio protocol. A future ESP32 bridge should use
-this same envelope on the laptop-facing USB serial link.
+Ownership is released only after COMPLETE is successfully delivered to the sender. A lost END, NACK, or COMPLETE therefore does not incorrectly free the channel.
 
-## Run protocol tests
+Later, the simulated listen/backoff decision can be replaced by ESP32 + LoRa Channel Activity Detection/listen-before-talk without changing Tian's queue/reliability logic.
+
+## Three-process simulator
+
+Run three programs, each with its own terminal:
+
+### Terminal 1 — Simulation control / monitor panel
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
+python3 -m simulation.panel --scenario simulation/scenarios/example.json
 ```
 
-## Run a Tian serial node
-
-Node A:
+### Terminal 2 — Tian Software A
 
 ```bash
-python tian_serial_node.py --node-id 1 --port /dev/ttyUSB0
+python3 -m simulation.node_process --name A --id 1
 ```
 
-Node B:
+### Terminal 3 — Tian Software B
 
 ```bash
-python tian_serial_node.py --node-id 2 --port /dev/ttyUSB0
+python3 -m simulation.node_process --name B --id 2
 ```
 
-Commands:
+On KDE/Pop!_OS, this launcher tries `konsole`, then `gnome-terminal`, then `xterm`:
+
+```bash
+python3 simulation/launch_three_terminals.py
+```
+
+The two Tian terminals show their own TX/RX, queue, timeout, NACK, retransmission and received-message traces. The panel shows arbitration, sequence number, selected random-loss indexes, PASS/DROP decisions, channel release and final statistics.
+
+## Unlimited configurable loss sequences
+
+`simulation/scenarios/example.json` contains an ordered `sequences` list. Add as many entries as you want.
+
+Each sequence applies to **one sender TX window and the NACK/COMPLETE response caused by that window**. This means later sequences naturally control later retransmission rounds.
+
+### No DATA loss
+
+```json
+{"name":"clean", "data_loss":{"mode":"none"}}
+```
+
+### Manual packet indexes
+
+```json
+{"name":"round 1", "data_loss":{"mode":"manual", "indexes":[1,2,5]}}
+```
+
+Example progressive test:
 
 ```text
-send hello from this node
-status
-quit
+Sequence 1: drop [1,2,5]
+Sequence 2: retransmission window drops [2,5]
+Sequence 3: retransmission window drops [5]
+Sequence 4: clean
 ```
 
-Example trace:
+The receiver should generate successively smaller NACKs until COMPLETE.
+
+### Random exact count
+
+```json
+{"name":"random 3", "data_loss":{"mode":"random_count", "count":3}}
+```
+
+The panel randomly chooses exactly three indexes **from the DATA packets actually present in that sequence's current TX window**.
+
+### Random probability
+
+```json
+{"name":"random 20 percent", "data_loss":{"mode":"random_probability", "probability":0.20}}
+```
+
+Every DATA packet in that sequence has a 20% independent drop chance.
+
+### Reproducible randomness
+
+At the top of the scenario:
+
+```json
+"seed": 48291
+```
+
+Use the same seed to reproduce the same arbitration and random-loss choices. Set it to `null` for different choices each run.
+
+## Control-frame fault injection
+
+Any sequence may additionally contain:
+
+```json
+"drop_end": true,
+"drop_nack": true,
+"drop_complete": true
+```
+
+These can be combined with DATA loss. If END/NACK/COMPLETE is lost, the sender's response timeout causes Tian Software to retry END and continue the protocol.
+
+## Example scenario behavior
+
+The included example tests:
 
 ```text
-TX node=1 msg=0x12345678 DATA #0/5
-TX node=1 msg=0x12345678 END round=0
-RX node=2 msg=0x12345678 NACK page #0/0
-TX node=1 msg=0x12345678 DATA #3/5
-TX node=1 msg=0x12345678 END round=1
-RX node=2 msg=0x12345678 COMPLETE
+1. Both A and B request the channel.
+2. Randomized contention chooses one first.
+3. Manual multiple DATA loss.
+4. Another manual loss on retransmission.
+5. Random exact-count loss on another retry.
+6. Random-probability sequence.
+7. Other Tian Software gets the channel next.
+8. DATA is lost and its NACK is deliberately lost.
+9. Sender times out and retries END.
+10. NACK is received, missing DATA is retransmitted, COMPLETE finishes the transfer.
 ```
 
-## Current half-duplex rule
+## Serial contract for ESP32
 
-Each node is dynamically capable of sending and receiving, but two nodes should
-not initiate new user transfers at exactly the same time yet. Normal protocol
-turnaround is supported:
+`serial_transport.py` is the stable Tian Software ↔ ESP32 boundary.
 
 ```text
-A TX DATA...END -> B RX
-A RX <- B TX NACK/COMPLETE
-A TX retransmission...END -> B RX
+[uint16 big-endian frame length][encoded LoRe frame bytes]
 ```
 
-A later channel-arbitration mechanism can resolve simultaneous initiation when
-more realistic radio behavior is added.
-
-## Next stage
-
-Connect `FramedSerialTransport` to an ESP32 bridge. The ESP32 contract is small:
+Current maximum DATA frame is 198 bytes:
 
 ```text
-laptop serial RX -> read length -> read frame -> radio_tx(frame bytes)
-radio_rx(frame bytes) -> serial TX length + frame
+16-byte protocol header
+180-byte payload
+2-byte CRC-16
 ```
 
-This lets the reliability state machine remain in Tian while the ESP32 handles
-transport and LoRa TX/RX switching.
+Future ESP32 firmware should only need:
+
+```text
+Laptop USB serial RX
+ -> read 2-byte frame length
+ -> read exactly N frame bytes
+ -> radio TX frame bytes
+
+Radio RX frame bytes
+ -> prepend 2-byte length
+ -> USB serial TX
+```
+
+ESP32 does **not** need to reconstruct files, decide missing indexes, create NACKs, decrypt content, or own Tian protocol state.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The branch includes the original reliability tests plus `test_tian_software_dynamic.py` for two-way Tian Software transfer and retransmission.
