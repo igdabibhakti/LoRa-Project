@@ -6,8 +6,9 @@ from lore_protocol import Frame, FrameType, decode_missing_indexes
 from simulation.common import send_json, b64d
 
 class Panel:
-    def __init__(self, cfg):
+    def __init__(self, cfg, live=False):
         self.cfg = cfg
+        self.live = live
         self.rng = random.Random(cfg.get("seed"))
         self.nodes = {}; self.buffers = {}; self.sel = selectors.DefaultSelector()
         self.owner = None; self.waiting = []; self.req_times = {}
@@ -25,7 +26,8 @@ class Panel:
         listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((host, port)); listener.listen(); listener.setblocking(False)
         self.sel.register(listener, selectors.EVENT_READ, data="listener")
-        self.log(f"listening {host}:{port}; waiting for A and B")
+        mode = "LIVE" if self.live else "SCENARIO"
+        self.log(f"{mode} panel listening {host}:{port}; waiting for A and B")
         while True:
             for key, _ in self.sel.select(0.05):
                 if key.data == "listener":
@@ -33,9 +35,9 @@ class Panel:
                     self.sel.register(conn, selectors.EVENT_READ, data=None); self.buffers[conn] = b""
                 else: self.read_sock(key.fileobj)
             self.arbitrate()
-            if len(self.nodes) == 2 and not getattr(self, "loaded", False):
+            if not self.live and len(self.nodes) == 2 and not getattr(self, "loaded", False):
                 self.loaded = True; self.load_messages()
-            if getattr(self, "loaded", False) and self.done():
+            if not self.live and getattr(self, "loaded", False) and self.done():
                 self.log(f"DONE completed={self.completed}/{len(self.cfg.get('messages', []))} delivered={self.stats['delivered']} dropped={self.stats['dropped']}")
                 for sock in self.nodes.values(): send_json(sock, {"type": "STOP"})
                 return
@@ -43,7 +45,20 @@ class Panel:
     def read_sock(self, sock):
         try: data = sock.recv(65536)
         except BlockingIOError: return
-        if not data: return
+        if not data:
+            try: self.sel.unregister(sock)
+            except Exception: pass
+            self.buffers.pop(sock, None)
+            for name, connected in list(self.nodes.items()):
+                if connected is sock:
+                    self.nodes.pop(name, None)
+                    if self.owner == name: self.owner = None
+                    if name in self.waiting: self.waiting.remove(name)
+                    self.req_times.pop(name, None)
+                    self.log(f"{name} disconnected")
+            try: sock.close()
+            except OSError: pass
+            return
         buf = self.buffers[sock] + data
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
@@ -99,6 +114,9 @@ class Panel:
 
     def deliver(self, sender, data64, seq_idx, seq, force_drop=False):
         frame = Frame.decode(b64d(data64)); other = "B" if sender == "A" else "A"; lost = force_drop
+        if other not in self.nodes:
+            self.log(f"cannot deliver {sender}->{other}; destination not connected")
+            return False
         if frame.frame_type == FrameType.END: lost = lost or bool(seq.get("drop_end", False))
         elif frame.frame_type == FrameType.NACK: lost = lost or bool(seq.get("drop_nack", False))
         elif frame.frame_type == FrameType.COMPLETE: lost = lost or bool(seq.get("drop_complete", False))
@@ -130,10 +148,11 @@ class Panel:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default=str(Path(__file__).parent / "scenarios" / "example.json"))
+    ap.add_argument("--live", action="store_true", help="stay open for interactive nodes instead of preloading messages")
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
     cfg = json.load(open(args.scenario))
     print("=== SIMULATION CONTROL / MONITOR PANEL ==="); print(json.dumps(cfg, indent=2))
-    Panel(cfg).run(args.host, args.port)
+    Panel(cfg, live=args.live).run(args.host, args.port)
 
 if __name__ == "__main__": main()
