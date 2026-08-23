@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent
 SCENARIO_DIR = ROOT / "simulation" / "scenarios"
 DEFAULT_SCENARIO = SCENARIO_DIR / "example.json"
 QUICK_SCENARIO = SCENARIO_DIR / "quick_last.json"
+LIVE_CHANNEL_SCENARIO = SCENARIO_DIR / "live_channel.json"
 
 
 def ask(prompt: str, default: str = "") -> str:
@@ -84,6 +85,24 @@ def launch(path: Path) -> None:
     subprocess.run([sys.executable,str(ROOT/'simulation'/'launch_three_terminals.py'),'--scenario',str(path)],check=True)
 
 
+def launch_live() -> None:
+    print("\n=== LIVE INTERACTIVE TWO-TIAN SIMULATION ===")
+    print("Three terminals will open: Channel Panel, Tian A, Tian B.")
+    print("Both Tian terminals accept normal text and /image <path> live.")
+    print("Each Tian terminal can also load its own node scenario with /load <file.json>.")
+    print("\nOptional startup node scenarios:")
+    a_raw=ask("A scenario path (Enter = manual only)","")
+    b_raw=ask("B scenario path (Enter = manual only)","")
+    autorun=False
+    if a_raw or b_raw:
+        autorun=ask("Autorun loaded scenario(s)? y/n","n").lower().startswith('y')
+    command=[sys.executable,str(ROOT/'simulation'/'launch_live_terminals.py'),'--panel-scenario',str(LIVE_CHANNEL_SCENARIO)]
+    if a_raw: command += ['--a-scenario',str(Path(a_raw).expanduser().resolve())]
+    if b_raw: command += ['--b-scenario',str(Path(b_raw).expanduser().resolve())]
+    if autorun: command += ['--autorun']
+    subprocess.run(command,check=True)
+
+
 def quick_test() -> Path:
     print("\n=== QUICK TEST ===")
     print("1) A -> B")
@@ -139,14 +158,15 @@ def show_json(path: Path): print(json.dumps(load_json(path),indent=2))
 def main():
     while True:
         print("\n====================================\n LoRe / Tian Software Simulator\n====================================")
-        print("1) QUICK TEST (recommended)\n2) Run saved JSON scenario\n3) View / validate JSON scenario\n4) Run included example\n5) Exit")
-        choice=ask("Choose","1")
+        print("1) QUICK TEST (predefined messages)\n2) LIVE INTERACTIVE A <-> B\n3) Run saved JSON channel scenario\n4) View / validate JSON channel scenario\n5) Run included example\n6) Exit")
+        choice=ask("Choose","2")
         try:
             if choice=='1': launch(quick_test()); return
-            if choice=='2': path=choose_json(); show_json(path); launch(path); return
-            if choice=='3': show_json(choose_json()); continue
-            if choice=='4': show_json(DEFAULT_SCENARIO); launch(DEFAULT_SCENARIO); return
-            if choice=='5': return
+            if choice=='2': launch_live(); return
+            if choice=='3': path=choose_json(); show_json(path); launch(path); return
+            if choice=='4': show_json(choose_json()); continue
+            if choice=='5': show_json(DEFAULT_SCENARIO); launch(DEFAULT_SCENARIO); return
+            if choice=='6': return
         except (OSError,ValueError,json.JSONDecodeError,subprocess.CalledProcessError) as exc:
             print(f"ERROR: {exc}")
 
