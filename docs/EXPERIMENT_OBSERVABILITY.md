@@ -1,196 +1,274 @@
 # Experiment Observability: Tian Nodes + Panel
 
-This simulator is an experiment, so the live mode now shows more than the final text or reconstructed image.
+The live simulator is designed as an experiment, so it exposes more than the final text or reconstructed image.
 
-The observability design has two levels:
+The logging/preview system is observational only. It does not change LoRe protocol bytes or reliability behavior.
+
+## 1. Two observability levels
 
 ```text
 TIAN A / TIAN B
-    detailed endpoint view
-    encode -> queue -> channel -> frames -> retries -> decode -> result
+    endpoint view
+    encode -> queue -> TX/RX frames -> retries -> decode -> final result
 
 PANEL
-    central experiment view
-    encode -> transmit -> packet loss/retry -> decode
-    optional full metadata dump
+    shared-channel view
+    encode -> transmit -> PASS/DROP -> response/retry -> decode
+    optional full metadata
 ```
 
-The reliability protocol itself is unchanged by these logs. The trace information is observational only.
+## 2. `[EXPRIMT]` prefix
 
-## 1. What each Tian node now shows
-
-When A or B sends text/image, it prints the Tian application processing first.
-
-Text example:
+High-level Tian experiment information uses:
 
 ```text
-[EXPERIMENT] === TIAN ENCODING PROCESS ===
-[EXPERIMENT] direction: ENCODE
-[EXPERIMENT] content_type: TEXT
-[EXPERIMENT] raw_bytes: 7
-[EXPERIMENT] raw_preview: Hello B
-[EXPERIMENT] application_header_bytes: 8
-[EXPERIMENT] encryption: AES-GCM (12B nonce + cipher + 16B tag)
-[EXPERIMENT] encrypted_bytes: ...
-[EXPERIMENT] raw_hex: ...
-[EXPERIMENT] encrypted_hex: ...
+[EXPRIMT]
 ```
 
-Image processing additionally shows values such as:
+This is intentionally shorter than the older `[EXPERIMENT]` label.
+
+Examples:
 
 ```text
-original file size
+[EXPRIMT] === TIAN ENCODING PROCESS ===
+[EXPRIMT] === INITIAL TRANSMISSION ===
+[EXPRIMT] === SELECTIVE RETRANSMISSION ROUND 1 ===
+[EXPRIMT] === TIAN DECODING PROCESS ===
+```
+
+## 3. TX/RX lines are the authoritative per-frame view
+
+The node terminal prioritizes:
+
+```text
+TX or RX
+-> protocol command
+-> protocol-specific information
+-> other frame information
+```
+
+Examples:
+
+```text
+[TX] DATA index=0 total=38 message_id=0x12345678 content=IMAGE frame_bytes=198
+[RX] DATA index=0 total=38 message_id=0x12345678 content=IMAGE frame_bytes=198
+[TX] END round=0 message_id=0x12345678 content=IMAGE frame_bytes=18
+[RX] NACK [2, 5] message_id=0x12345678 content=IMAGE frame_bytes=...
+[RX] COMPLETE message_id=0x12345678 content=IMAGE frame_bytes=18
+```
+
+The node no longer prints a second duplicate `[EXPRIMT] DATA ...` row for each frame.
+
+The transmission-window summary is still shown once before the frames:
+
+```text
+[EXPRIMT] === INITIAL TRANSMISSION ===
+[EXPRIMT] message_id=0x12345678 content=IMAGE
+[EXPRIMT] DATA frames=38 indexes=[0, 1, ...] all_frames=39 encoded_window=...B
+[EXPRIMT] tx_delay=slow inter_frame_delay=250ms
+```
+
+## 4. Tian encoding detail
+
+Text trace can show:
+
+```text
+content type
+UTF-8 byte count
+text preview
+8-byte application timestamp header
+application byte count
+AES-GCM processing
+encrypted byte count
+hex previews
+```
+
+Image trace additionally shows:
+
+```text
+source path
+original byte count
 original dimensions
 RGB thumbnail dimensions
 JPEG quality 50
 JPEG byte count
-zlib compressed byte count
+zlib compression
+compressed byte count
 AES-GCM encrypted byte count
-hex previews of important processing stages
+hex previews
 ```
 
-This intentionally resembles the original Tian demo, which exposed image compression, encryption, hex data, and final decode steps.
+This intentionally restores the detailed experimental feel of the original Tian demo.
 
-## 2. Transmission detail on each Tian node
+## 5. Tian decode detail
 
-After the node obtains the channel, it prints a transmission-window summary.
+When the receiver reconstructs a complete payload, it shows the reverse processing path before the final message line.
 
-Example:
+Text:
 
 ```text
-[EXPERIMENT] === INITIAL TRANSMISSION ===
-[EXPERIMENT] message_id=0x12345678 content=IMAGE
-[EXPERIMENT] DATA frames=7 indexes=[0, 1, 2, 3, 4, 5, 6] all_frames=8 encoded_window=...B
-[EXPERIMENT] DATA index=0/7 frame=198B payload=180B header=16B crc=0x....
-...
-[EXPERIMENT] END frame=18B payload=0B header=16B crc=0x....
+AES-GCM authenticated decrypt
+application timestamp/header extraction
+UTF-8 decode
+text preview
 ```
 
-Individual TX/RX lines also contain experiment identifiers:
-
-```text
-[TX] DATA index=0 total=7 message_id=0x12345678 content=IMAGE frame_bytes=198
-[RX] NACK [2, 5] message_id=0x12345678 content=IMAGE frame_bytes=...
-```
-
-This makes it easier to connect a user-level text/image with the actual protocol frames.
-
-## 3. Retransmission visibility
-
-If a NACK requests missing DATA packets, the sender prints a new window:
-
-```text
-[EXPERIMENT] === SELECTIVE RETRANSMISSION ROUND 1 ===
-[EXPERIMENT] DATA frames=2 indexes=[2, 5]
-...
-```
-
-If NACK/COMPLETE is lost and a timeout happens:
-
-```text
-[TIMEOUT] no NACK/COMPLETE -> retry protocol window
-[EXPERIMENT] === TIMEOUT RETRY ROUND 2 ===
-...
-```
-
-So the node terminal can be used to study exactly which packets were sent initially and which packets were resent.
-
-## 4. Decode detail on receiver
-
-When a full message is reconstructed, the receiver shows the decode process before printing the final message.
-
-Text example:
-
-```text
-[EXPERIMENT] === TIAN DECODING PROCESS ===
-[EXPERIMENT] content_type: TEXT
-[EXPERIMENT] encrypted_bytes: ...
-[EXPERIMENT] decryption: AES-GCM authenticated decrypt
-[EXPERIMENT] application_header_bytes: 8
-[EXPERIMENT] result: UTF-8 text
-[EXPERIMENT] text_preview: Hello B
-
-[MESSAGE] TEXT from=1: Hello B
-```
-
-Image example also shows:
+Image:
 
 ```text
 AES-GCM decrypt
 application payload extraction
-zlib -> JPEG decompression
+zlib decompression
 JPEG byte count
-final dimensions
+image dimensions
 saved output path
 ```
 
-## 5. Panel always shows concise ENCODE -> TRANSMIT -> DECODE
-
-The panel remains the central packet/channel monitor, but it now also receives observational traces from A and B.
-
-Typical output:
+Then the final application result is printed:
 
 ```text
-[PANEL] [ENCODE] A TEXT source=7B -> encrypted=43B 'Hello B'
-[PANEL] A requests channel
-[PANEL] [TRANSMIT] A msg=0x12345678 content=TEXT DATA=1 indexes=[0] window=...B
-[PANEL] SEQ 1 live-clean-default PASS A->B DATA#0
-[PANEL] SEQ 1 live-clean-default PASS A->B END
-[PANEL] SEQ 1 live-clean-default PASS B->A COMPLETE
-[PANEL] [DECODE] B TEXT encrypted=43B -> Hello B
+[MESSAGE] TEXT from=1: Hello B
 ```
 
-This concise view stays enabled even when full metadata mode is OFF.
+or:
 
-## 6. Panel metadata commands
+```text
+[MESSAGE] IMAGE from=1 saved=... size=... jpeg=...B
+```
 
-Type commands directly into the PANEL terminal.
+## 6. Retransmission visibility
 
-### Show the latest snapshot once
+If a receiver sends:
+
+```text
+NACK [2,5]
+```
+
+then the sender shows a selective retry window:
+
+```text
+[EXPRIMT] === SELECTIVE RETRANSMISSION ROUND 1 ===
+[EXPRIMT] DATA frames=2 indexes=[2, 5] ...
+[TX] DATA index=2 ...
+[TX] DATA index=5 ...
+[TX] END round=1 ...
+```
+
+If a control response is lost:
+
+```text
+[TIMEOUT] no NACK/COMPLETE -> retry protocol window
+[EXPRIMT] === TIMEOUT RETRY ROUND ... ===
+[TX] END ...
+```
+
+## 7. Real TX delay vs scenario pacing
+
+These are different controls.
+
+### Real protocol-frame delay
+
+```text
+/delay normal
+/delay slow
+/delay very-slow
+/delay 0.5
+```
+
+Current presets:
+
+```text
+normal    = 0s between protocol frames
+slow      = 0.25s between protocol frames
+very-slow = 1s between protocol frames
+```
+
+This slows actual DATA / END / NACK / COMPLETE transmission from that Tian process.
+
+### Scenario action pacing
+
+```text
+/pacing normal
+/pacing slow
+/pacing very-slow
+```
+
+This affects time between scripted node actions/messages, not individual protocol frames.
+
+See:
+
+```text
+docs/REAL_PACKET_DELAY.md
+docs/NODE_SCENARIO_PACING.md
+```
+
+## 8. Panel DATA is streamed live
+
+The live Panel no longer buffers all DATA until END.
+
+With `/delay slow`, the expected visual flow is:
+
+```text
+A [TX] DATA 0
+Panel PASS/DROP A->B DATA#0
+B [RX] DATA 0 if passed
+
+0.25s later
+
+A [TX] DATA 1
+Panel PASS/DROP A->B DATA#1
+B [RX] DATA 1 if passed
+```
+
+END is only the sender-window boundary used by the receiver to decide whether to send NACK or COMPLETE.
+
+This streaming behavior is important when using the simulator to understand protocol timing.
+
+## 9. Panel concise view
+
+The Panel always shows concise experiment information such as:
+
+```text
+[PANEL] [ENCODE] A IMAGE source=... -> encrypted=...
+[PANEL] A requests channel
+[PANEL] [TRANSMIT] A msg=... content=IMAGE DATA=38 indexes=[...]
+[PANEL] SEQ 1 ... PASS A->B DATA#0
+[PANEL] SEQ 1 ... DROP A->B DATA#5
+[PANEL] SEQ 1 ... PASS A->B END
+[PANEL] SEQ 1 ... PASS B->A NACK[5]
+[PANEL] [DECODE] B IMAGE encrypted=... -> 240x...
+```
+
+## 10. Panel metadata commands
 
 ```text
 PANEL> /metadata current
-```
-
-This prints the most recently captured metadata without enabling continuous metadata spam.
-
-Use this when you normally want a clean panel but occasionally want to inspect the latest transfer deeply.
-
-Aliases accepted by the implementation include `now` and `preview`.
-
-### Automatically preview metadata for every sequence
-
-```text
 PANEL> /metadata on
-```
-
-Now every DATA/END TX or retransmission window prints its full sequence metadata automatically.
-
-This mode is useful for an experiment where every retry window must be recorded and visually inspected.
-
-### Turn automatic metadata back off
-
-```text
 PANEL> /metadata off
-```
-
-Concise ENCODE / TRANSMIT / DECODE and PASS/DROP logs remain visible.
-
-### Check mode
-
-```text
 PANEL> /metadata status
 ```
 
-### Show panel commands
+### `/metadata current`
 
-```text
-PANEL> /help
-```
+Shows the latest captured metadata once.
 
-## 7. What full sequence metadata contains
+Use this when you normally want concise logs but occasionally want a deep snapshot.
 
-For each TX/retry sequence the panel can show:
+### `/metadata on`
+
+Automatically prints full metadata for every new sender/retry sequence.
+
+### `/metadata off`
+
+Stops automatic full metadata. Concise Panel logs remain active.
+
+### `/metadata status`
+
+Shows whether automatic metadata mode is enabled.
+
+## 11. Full sequence metadata
+
+A sequence metadata snapshot can contain:
 
 ```text
 sequence number
@@ -198,16 +276,18 @@ sequence name
 sender
 message ID
 content type
+window kind
+expected DATA indexes
 configured DATA-loss rule
 actual chosen DATA indexes to drop
-drop_end
-drop_nack
-drop_complete
-number of DATA frames
+Drop END setting
+Drop NACK setting
+Drop COMPLETE setting
+DATA frames seen
 encoded DATA bytes
 ```
 
-Each DATA frame also includes:
+Frame metadata can include:
 
 ```text
 frame type
@@ -216,85 +296,41 @@ source node ID
 message ID
 total packet count
 packet index
-payload byte count
-protocol header byte count
-CRC byte count
-encoded frame byte count
+payload bytes
+16-byte header size
+2-byte CRC size
+encoded frame size
 CRC-16 value
-hex preview of the encoded frame
+encoded frame hex preview
 ```
 
-## 8. `current` versus `on`
+## 12. Panel scenario builder and observability
 
-The intended distinction is simple:
+Use:
 
 ```text
-/metadata current
-    show the latest metadata ONCE
-    then return to concise normal display
-
-/metadata on
-    automatically show metadata on EVERY new TX/retry sequence
-    keep doing this until /metadata off
+PANEL> /scenario make
 ```
 
-For a normal interactive test, start with metadata OFF.
+to create packet-loss/control-loss experiments in the terminal.
 
-For example:
+This is separate from Tian A/B node scenario creation.
+
+See:
 
 ```text
-A sends image
-panel shows normal packet flow
-PANEL> /metadata current
-inspect the latest image-transfer metadata
-continue normally
+docs/CHANNEL_SCENARIO_BUILDER.md
 ```
 
-For a formal experiment where every retry sequence matters:
+for the exact meaning of DATA loss, Drop END, Drop NACK and Drop COMPLETE.
 
-```text
-PANEL> /metadata on
-```
+## 13. Observability does not change protocol bytes
 
-before starting A/B scenarios.
+Experiment trace dictionaries are sent only over localhost simulator control messages.
 
-## 9. Relationship to node scenario delay/pacing
+They are not inserted into LoRe DATA payloads.
 
-Scenario timing and metadata are independent.
-
-For example:
-
-```text
-A> /delay slow
-```
-
-makes A's scenario easier to watch by adding +2 seconds between actions.
-
-Meanwhile:
-
-```text
-PANEL> /metadata on
-```
-
-makes the panel print full metadata for each actual protocol TX/retry sequence.
-
-A useful teaching/debugging setup is therefore:
-
-```text
-A pacing = slow
-B pacing = slow
-Panel metadata = on
-```
-
-This gives enough time to read encode, arbitration, packet, retry, and decode information as it happens.
-
-## 10. Important: observability does not change protocol bytes
-
-The codec trace dictionaries and experiment displays are not embedded into LoRe DATA frames.
-
-They travel only through the localhost simulation control connection so the panel can display them.
-
-The actual reliable protocol still sends the normal encoded LoRe frames:
+The actual reliable protocol remains:
 
 ```text
 DATA
@@ -303,4 +339,4 @@ NACK
 COMPLETE
 ```
 
-This distinction matters when interpreting experiment results: enabling metadata display changes logging volume, not the simulated radio protocol.
+Therefore turning metadata on changes logging volume, not the simulated RF protocol.
