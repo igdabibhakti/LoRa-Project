@@ -1,0 +1,20 @@
+{
+  "name": "Example scenario for Tian B",
+  "actions": [
+    {
+      "delay": 1,
+      "type": "text",
+      "text": "Hello A, this message comes from B's scenario"
+    },
+    {
+      "delay": 2,
+      "type": "text",
+      "text": "B is replying while A may still have queued traffic"
+    },
+    {
+      "delay": 3,
+      "type": "text",
+      "text": "B scenario finished"
+    }
+  ]
+}
