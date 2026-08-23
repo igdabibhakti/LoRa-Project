@@ -7,8 +7,10 @@ ap = argparse.ArgumentParser(description="Open live Panel, Tian Software A, and 
 ap.add_argument("--panel-scenario", default=str(root / "simulation/scenarios/live_channel.json"))
 ap.add_argument("--a-scenario")
 ap.add_argument("--b-scenario")
-ap.add_argument("--a-delay", default="normal", help="A scenario pacing: normal, slow, very-slow, or seconds")
-ap.add_argument("--b-delay", default="normal", help="B scenario pacing: normal, slow, very-slow, or seconds")
+ap.add_argument("--a-delay", default="normal", help="A REAL inter-frame TX delay: normal, slow, very-slow, or seconds")
+ap.add_argument("--b-delay", default="normal", help="B REAL inter-frame TX delay: normal, slow, very-slow, or seconds")
+ap.add_argument("--a-pacing", help="optional A scenario action pacing override")
+ap.add_argument("--b-pacing", help="optional B scenario action pacing override")
 ap.add_argument("--autorun", action="store_true", help="autorun any preloaded node scenarios")
 args = ap.parse_args()
 
@@ -17,14 +19,16 @@ panel_scenario = str(Path(args.panel_scenario).expanduser().resolve())
 commands = [
     f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.panel --live --scenario {shlex.quote(panel_scenario)}",
 ]
-for name, node_id, scenario, delay in [
-    ("A", 1, args.a_scenario, args.a_delay),
-    ("B", 2, args.b_scenario, args.b_delay),
+for name, node_id, scenario, delay, pacing in [
+    ("A", 1, args.a_scenario, args.a_delay, args.a_pacing),
+    ("B", 2, args.b_scenario, args.b_delay, args.b_pacing),
 ]:
     cmd = (
         f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.interactive_node "
         f"--name {name} --id {node_id} --delay {shlex.quote(str(delay))}"
     )
+    if pacing is not None:
+        cmd += f" --pacing {shlex.quote(str(pacing))}"
     if scenario:
         cmd += f" --scenario {shlex.quote(str(Path(scenario).expanduser().resolve()))}"
         if args.autorun:
@@ -49,7 +53,9 @@ for command in commands:
 
 print("Started live 3-terminal simulation")
 print(f"Panel channel scenario: {panel_scenario}")
-print(f"A scenario pacing: {args.a_delay}")
-print(f"B scenario pacing: {args.b_delay}")
+print(f"A REAL TX frame delay: {args.a_delay}")
+print(f"B REAL TX frame delay: {args.b_delay}")
+if args.a_pacing is not None: print(f"A scenario action pacing override: {args.a_pacing}")
+if args.b_pacing is not None: print(f"B scenario action pacing override: {args.b_pacing}")
 if args.a_scenario: print(f"A node scenario: {args.a_scenario}")
 if args.b_scenario: print(f"B node scenario: {args.b_scenario}")
