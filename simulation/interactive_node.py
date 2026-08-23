@@ -20,17 +20,9 @@ from tian_software import TianSoftware
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SCENARIO_PACING_PRESETS = {
-    "normal": 0.0,
-    "slow": 2.0,
-    "very-slow": 5.0,
-}
-
-TX_FRAME_DELAY_PRESETS = {
-    "normal": 0.0,
-    "slow": 0.25,
-    "very-slow": 1.0,
-}
+SCENARIO_PACING_PRESETS = {"normal": 0.0, "slow": 2.0, "very-slow": 5.0}
+TX_FRAME_DELAY_PRESETS = {"normal": 0.0, "slow": 0.25, "very-slow": 1.0}
+BUILDER_COMMANDS = {"make", "new", "edit", "builder"}
 
 
 def desc(frame: Frame) -> str:
@@ -80,7 +72,6 @@ class ScenarioPlayer:
         self.extra_delay = 0.0
 
     def set_delay(self, raw: str | float | int | None = None) -> None:
-        """Set scenario ACTION pacing. User-facing command is /pacing."""
         if raw is None:
             print(
                 f"[PACING] {self.delay_name} = +{self.extra_delay:g}s between scripted actions",
@@ -232,7 +223,10 @@ class InteractiveNode:
                 f"[TX DELAY] {self.tx_delay_name} = {self.tx_frame_delay:g}s between protocol frames",
                 flush=True,
             )
-            print("[TX DELAY] normal=0s, slow=0.25s, very-slow=1s, /delay 0.5=0.5s", flush=True)
+            print(
+                "[TX DELAY] normal=0s, slow=0.25s, very-slow=1s, /delay 0.5=0.5s",
+                flush=True,
+            )
             return
         name, seconds = parse_tx_frame_delay(raw)
         self.tx_delay_name = name
@@ -241,18 +235,15 @@ class InteractiveNode:
             f"[TX DELAY] set to {name}: {seconds:g}s between DATA/END/NACK/COMPLETE frames",
             flush=True,
         )
-        if seconds == 0:
-            print("[TX DELAY] NORMAL: frames are emitted as fast as the simulator can send them.", flush=True)
-        elif seconds <= 0.25:
-            print("[TX DELAY] SLOW: individual packets should now be easy to see in the terminal.", flush=True)
-        else:
-            print("[TX DELAY] VERY SLOW/CUSTOM: intended for close observation and demos.", flush=True)
 
     def report_encode(self, prepared) -> None:
         trace = dict(prepared.trace)
         self.pending_encode_traces.append(trace)
         print_trace_block("TIAN ENCODING PROCESS", trace)
-        send_json(self.sock, {"type": "TRACE", "node": self.name, "stage": "ENCODE", "trace": trace})
+        send_json(
+            self.sock,
+            {"type": "TRACE", "node": self.name, "stage": "ENCODE", "trace": trace},
+        )
 
     def enqueue_text(self, text: str) -> None:
         prepared = prepare_text(text)
@@ -290,7 +281,36 @@ class InteractiveNode:
             self.requested = True
             print("[CHANNEL] requested", flush=True)
 
+    def _builder_requested(self, command: str, argument: str) -> bool:
+        if command not in {"/scenario", "/protocol"}:
+            return False
+        subcommand = argument.strip().partition(" ")[0].lower()
+        return subcommand in BUILDER_COMMANDS
+
+    def _run_builder_from_stdin(self) -> None:
+        """Run the modal builder in the one and only stdin-reading thread."""
+        try:
+            new_path = run_terminal_builder(
+                self.name,
+                self.scenario_store,
+                self.scenario.path,
+                self.scenario.config if self.scenario.actions else None,
+                self.scenario.config.get("pacing", self.scenario.delay_name),
+            )
+        except (EOFError, KeyboardInterrupt):
+            print("\n[SCENARIO] builder cancelled", flush=True)
+            return
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[ERROR] scenario builder: {exc}", flush=True)
+            return
+        if new_path:
+            # The network/main loop owns scenario state changes. The stdin
+            # thread only gathers terminal input, then asks the main loop to
+            # load the newly saved file.
+            self.command_queue.put(("builder_saved", str(new_path)))
+
     def stdin_worker(self) -> None:
+        """Exclusive owner of keyboard input for the entire node process."""
         while self.running:
             try:
                 line = input(f"{self.name}> ")
@@ -303,9 +323,18 @@ class InteractiveNode:
             if not line.startswith("/"):
                 self.command_queue.put(("text", line))
                 continue
+
             command, _, argument = line.partition(" ")
             command = command.lower()
             argument = argument.strip()
+
+            # IMPORTANT: the scenario builder itself uses input(). Running it
+            # here prevents the old bug where the main loop and stdin_worker
+            # both waited on input() and stole each other's keystrokes.
+            if self._builder_requested(command, argument):
+                self._run_builder_from_stdin()
+                continue
+
             mapping = {
                 "/image": "image",
                 "/load": "load",
@@ -347,18 +376,14 @@ class InteractiveNode:
             self.scenario.load(path)
             self.scenario.preview()
             return
-        if subcommand in {"make", "new", "edit", "builder"}:
-            new_path = run_terminal_builder(
-                self.name,
-                self.scenario_store,
-                self.scenario.path,
-                self.scenario.config if self.scenario.actions else None,
-                self.scenario.config.get("pacing", self.scenario.delay_name),
+        if subcommand in BUILDER_COMMANDS:
+            # This is only a safety fallback. Normal terminal input intercepts
+            # builder commands in stdin_worker so the main loop never calls
+            # input() itself.
+            print(
+                "[SCENARIO] builder must run from the terminal input thread; type /scenario make again",
+                flush=True,
             )
-            if new_path:
-                self.scenario.load(new_path)
-                self.scenario.preview()
-                print("[SCENARIO] New file is preloaded. Type /run when ready.", flush=True)
             return
         print("Usage: /scenario list | select <number/name/path> | preview | make", flush=True)
 
@@ -377,6 +402,14 @@ class InteractiveNode:
                     self.scenario.preview()
                 else:
                     print("Usage: /load <node-scenario.json>", flush=True)
+            elif command == "builder_saved":
+                if argument:
+                    self.scenario.load(argument)
+                    self.scenario.preview()
+                    print(
+                        "[SCENARIO] New file is preloaded. Type /run when ready.",
+                        flush=True,
+                    )
             elif command == "run":
                 self.scenario.run()
             elif command == "pause":
@@ -474,12 +507,11 @@ class InteractiveNode:
             self.tx_round = 0
             self.send_frames_with_detail(frames, "INITIAL TRANSMISSION")
             self.last_tx = time.monotonic()
-        elif typ == "FRAME":
+            return
+
+        if typ == "FRAME":
             raw = b64d(message["data"])
             frame = Frame.decode(raw)
-            # Any valid response/activity resets the sender timeout clock. This is
-            # especially important when experiment pacing intentionally slows
-            # multi-frame NACK/response windows.
             self.last_tx = time.monotonic()
             print(
                 f"[RX] {desc(frame)} message_id=0x{frame.message_id:08X} "
@@ -496,6 +528,7 @@ class InteractiveNode:
                 )
                 self.send_frames_with_detail(responses, title)
                 self.last_tx = time.monotonic()
+
             for received in self.tian.pop_received_messages():
                 decoded = decode_received(
                     received.payload,
@@ -516,7 +549,7 @@ class InteractiveNode:
                     },
                 )
                 print(
-                    f"[EXPERIMENT] RECEIVE COMPLETE message_id=0x{received.message_id:08X} "
+                    f"[EXPRIMT] RECEIVE COMPLETE message_id=0x{received.message_id:08X} "
                     f"source={received.source_node_id} content={received.content_type.name}",
                     flush=True,
                 )
@@ -531,6 +564,7 @@ class InteractiveNode:
                         f"size={decoded['width']}x{decoded['height']} jpeg={decoded['bytes']}B\n",
                         flush=True,
                     )
+
             if frame.frame_type == FrameType.COMPLETE and not self.tian.outbound_busy:
                 print(
                     f"[TRANSFER] COMPLETE message_id=0x{frame.message_id:08X}; "
@@ -539,7 +573,9 @@ class InteractiveNode:
                 )
                 self.current_encode_trace = None
                 self.request_channel_if_needed()
-        elif typ == "STOP":
+            return
+
+        if typ == "STOP":
             self.running = False
 
     def run(
@@ -599,6 +635,7 @@ class InteractiveNode:
                 except queue.Empty:
                     break
                 self.handle_command(command, argument)
+
             self.request_channel_if_needed()
             self.sock.settimeout(0.05)
             try:
@@ -611,6 +648,7 @@ class InteractiveNode:
                 break
             for message in messages:
                 self.handle_message(message)
+
             if self.tian.outbound_busy and time.monotonic() - self.last_tx >= self.timeout:
                 retry = self.tian.retry_after_timeout()
                 if retry:
@@ -618,6 +656,7 @@ class InteractiveNode:
                     print("[TIMEOUT] no NACK/COMPLETE -> retry protocol window", flush=True)
                     self.send_frames_with_detail(retry, f"TIMEOUT RETRY ROUND {self.tx_round}")
                     self.last_tx = time.monotonic()
+
         self.scenario.stop()
         try:
             self.sock.close()
@@ -633,7 +672,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--timeout", type=float, default=1.2)
     parser.add_argument("--scenario", help="optional node scenario JSON to preload")
-    parser.add_argument("--autorun", action="store_true", help="start preloaded scenario immediately")
+    parser.add_argument(
+        "--autorun",
+        action="store_true",
+        help="start preloaded scenario immediately",
+    )
     parser.add_argument(
         "--delay",
         help="REAL inter-frame TX delay: normal, slow, very-slow, or custom seconds",
