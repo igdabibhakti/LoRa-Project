@@ -44,9 +44,59 @@ Ownership is released only after COMPLETE is successfully delivered to the sende
 
 Later, the simulated listen/backoff decision can be replaced by ESP32 + LoRa Channel Activity Detection/listen-before-talk without changing Tian's queue/reliability logic.
 
-## Three-process simulator
+## Recommended terminal-first workflow
 
-Run three programs, each with its own terminal:
+Everything can now be controlled from terminal without hand-editing JSON.
+
+Start with:
+
+```bash
+python3 lore_sim.py
+```
+
+or simply:
+
+```bash
+./RUN_ME.sh
+```
+
+The menu lets you:
+
+1. Create a scenario interactively and immediately run it.
+2. Load an existing JSON scenario and run it.
+3. Create/save a JSON scenario without running it.
+4. Review/validate an existing JSON scenario.
+5. Run the included example.
+
+When creating a scenario, the terminal asks for messages and then for an unlimited number of sequences. Each sequence can use:
+
+- no DATA loss;
+- manual indexes such as `1,2,5`;
+- random exact-count loss;
+- random-probability loss;
+- optional END loss;
+- optional NACK loss;
+- optional COMPLETE loss.
+
+The generated JSON is saved under `simulation/scenarios/`, so a terminal-created test can be repeated later exactly. A fixed random seed reproduces the same randomized selections; a blank seed produces new randomness each run.
+
+After configuration, the launcher opens three separate terminals:
+
+```text
+Simulation Control / Monitor Panel
+Tian Software A
+Tian Software B
+```
+
+The JSON method still works directly:
+
+```bash
+python3 simulation/launch_three_terminals.py --scenario simulation/scenarios/my_test.json
+```
+
+## Manual three-process simulator
+
+You may also run each process yourself.
 
 ### Terminal 1 — Simulation control / monitor panel
 
@@ -64,12 +114,6 @@ python3 -m simulation.node_process --name A --id 1
 
 ```bash
 python3 -m simulation.node_process --name B --id 2
-```
-
-On KDE/Pop!_OS, this launcher tries `konsole`, then `gnome-terminal`, then `xterm`:
-
-```bash
-python3 simulation/launch_three_terminals.py
 ```
 
 The two Tian terminals show their own TX/RX, queue, timeout, NACK, retransmission and received-message traces. The panel shows arbitration, sequence number, selected random-loss indexes, PASS/DROP decisions, channel release and final statistics.
@@ -140,23 +184,6 @@ Any sequence may additionally contain:
 ```
 
 These can be combined with DATA loss. If END/NACK/COMPLETE is lost, the sender's response timeout causes Tian Software to retry END and continue the protocol.
-
-## Example scenario behavior
-
-The included example tests:
-
-```text
-1. Both A and B request the channel.
-2. Randomized contention chooses one first.
-3. Manual multiple DATA loss.
-4. Another manual loss on retransmission.
-5. Random exact-count loss on another retry.
-6. Random-probability sequence.
-7. Other Tian Software gets the channel next.
-8. DATA is lost and its NACK is deliberately lost.
-9. Sender times out and retries END.
-10. NACK is received, missing DATA is retransmitted, COMPLETE finishes the transfer.
-```
 
 ## Serial contract for ESP32
 
