@@ -7,6 +7,8 @@ ap = argparse.ArgumentParser(description="Open live Panel, Tian Software A, and 
 ap.add_argument("--panel-scenario", default=str(root / "simulation/scenarios/live_channel.json"))
 ap.add_argument("--a-scenario")
 ap.add_argument("--b-scenario")
+ap.add_argument("--a-delay", default="normal", help="A scenario pacing: normal, slow, very-slow, or seconds")
+ap.add_argument("--b-delay", default="normal", help="B scenario pacing: normal, slow, very-slow, or seconds")
 ap.add_argument("--autorun", action="store_true", help="autorun any preloaded node scenarios")
 args = ap.parse_args()
 
@@ -15,8 +17,14 @@ panel_scenario = str(Path(args.panel_scenario).expanduser().resolve())
 commands = [
     f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.panel --live --scenario {shlex.quote(panel_scenario)}",
 ]
-for name, node_id, scenario in [("A", 1, args.a_scenario), ("B", 2, args.b_scenario)]:
-    cmd = f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.interactive_node --name {name} --id {node_id}"
+for name, node_id, scenario, delay in [
+    ("A", 1, args.a_scenario, args.a_delay),
+    ("B", 2, args.b_scenario, args.b_delay),
+]:
+    cmd = (
+        f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.interactive_node "
+        f"--name {name} --id {node_id} --delay {shlex.quote(str(delay))}"
+    )
     if scenario:
         cmd += f" --scenario {shlex.quote(str(Path(scenario).expanduser().resolve()))}"
         if args.autorun:
@@ -41,5 +49,7 @@ for command in commands:
 
 print("Started live 3-terminal simulation")
 print(f"Panel channel scenario: {panel_scenario}")
+print(f"A scenario pacing: {args.a_delay}")
+print(f"B scenario pacing: {args.b_delay}")
 if args.a_scenario: print(f"A node scenario: {args.a_scenario}")
 if args.b_scenario: print(f"B node scenario: {args.b_scenario}")
