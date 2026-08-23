@@ -18,6 +18,12 @@ from tian_software import TianSoftware
 
 ROOT = Path(__file__).resolve().parents[1]
 
+DELAY_PRESETS = {
+    "normal": 0.0,
+    "slow": 2.0,
+    "very-slow": 5.0,
+}
+
 
 def desc(frame: Frame) -> str:
     if frame.frame_type == FrameType.DATA:
@@ -29,6 +35,21 @@ def desc(frame: Frame) -> str:
     return "COMPLETE"
 
 
+def parse_scenario_delay(raw: str) -> tuple[str, float]:
+    value = raw.strip().lower().replace("_", "-")
+    if value in DELAY_PRESETS:
+        return value, DELAY_PRESETS[value]
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "delay must be normal, slow, very-slow, or a non-negative number of seconds"
+        ) from exc
+    if seconds < 0:
+        raise ValueError("delay seconds cannot be negative")
+    return f"custom-{seconds:g}s", seconds
+
+
 class ScenarioPlayer:
     def __init__(self, node: "InteractiveNode"):
         self.node = node
@@ -38,6 +59,33 @@ class ScenarioPlayer:
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.index = 0
+        self.delay_name = "normal"
+        self.extra_delay = 0.0
+
+    def set_delay(self, raw: str | None = None) -> None:
+        if raw is None:
+            print(
+                f"[DELAY] {self.delay_name} = +{self.extra_delay:g}s between scripted actions",
+                flush=True,
+            )
+            print(
+                "[DELAY] examples: normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s",
+                flush=True,
+            )
+            return
+        name, seconds = parse_scenario_delay(raw)
+        self.delay_name = name
+        self.extra_delay = seconds
+        print(
+            f"[DELAY] set to {name}: +{seconds:g}s between scripted actions",
+            flush=True,
+        )
+        if seconds == 0:
+            print("[DELAY] NORMAL: scenario uses only each action's JSON delay.", flush=True)
+        elif seconds <= 2:
+            print("[DELAY] SLOWER: each action after the first gets an extra short pause.", flush=True)
+        else:
+            print("[DELAY] VERY SLOW: useful when you want to read the terminal logs comfortably.", flush=True)
 
     def load(self, raw_path: str) -> None:
         path = Path(raw_path).expanduser().resolve()
@@ -57,6 +105,10 @@ class ScenarioPlayer:
         self.actions = actions
         self.index = 0
         print(f"[SCENARIO] loaded {len(actions)} actions from {path}", flush=True)
+        print(
+            f"[SCENARIO] node pacing={self.delay_name} (+{self.extra_delay:g}s between actions)",
+            flush=True,
+        )
 
     def run(self) -> None:
         if not self.actions:
@@ -69,12 +121,17 @@ class ScenarioPlayer:
         self.pause_event.clear()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
-        print(f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)}", flush=True)
+        print(
+            f"[SCENARIO] started at action {self.index + 1}/{len(self.actions)} pacing={self.delay_name}",
+            flush=True,
+        )
 
     def _worker(self) -> None:
         while self.index < len(self.actions) and not self.stop_event.is_set():
             action = self.actions[self.index]
-            delay = float(action.get("delay", 0))
+            base_delay = float(action.get("delay", 0))
+            pacing_delay = self.extra_delay if self.index > 0 else 0.0
+            delay = base_delay + pacing_delay
             deadline = time.monotonic() + delay
             while time.monotonic() < deadline and not self.stop_event.is_set():
                 while self.pause_event.is_set() and not self.stop_event.is_set():
@@ -123,7 +180,7 @@ class ScenarioPlayer:
         if self.pause_event.is_set():
             state = "paused"
         print(
-            f"[SCENARIO] state={state} file={self.path or '-'} progress={self.index}/{len(self.actions)}",
+            f"[SCENARIO] state={state} file={self.path or '-'} progress={self.index}/{len(self.actions)} pacing={self.delay_name} extra_delay=+{self.extra_delay:g}s",
             flush=True,
         )
 
@@ -197,6 +254,7 @@ class InteractiveNode:
                 "/pause": "pause",
                 "/resume": "resume",
                 "/stop": "stop",
+                "/delay": "delay",
                 "/scenario": "scenario",
                 "/status": "status",
                 "/help": "help",
@@ -230,6 +288,8 @@ class InteractiveNode:
             elif command == "stop":
                 self.scenario.stop()
                 print("[SCENARIO] stopped", flush=True)
+            elif command == "delay":
+                self.scenario.set_delay(argument)
             elif command == "scenario":
                 self.scenario.status()
             elif command == "status":
@@ -248,7 +308,12 @@ class InteractiveNode:
                     "  /pause               pause scenario\n"
                     "  /resume              resume scenario\n"
                     "  /stop                stop scenario\n"
-                    "  /scenario            show scenario progress\n"
+                    "  /delay               show current scenario pacing\n"
+                    "  /delay normal        +0s between scripted actions (JSON timing only)\n"
+                    "  /delay slow          +2s between scripted actions\n"
+                    "  /delay very-slow     +5s between scripted actions\n"
+                    "  /delay 1.5           custom +1.5s between scripted actions\n"
+                    "  /scenario            show scenario progress and pacing\n"
                     "  /status              show node status\n"
                     "  /help                show commands\n"
                     "  /quit                exit live simulation",
@@ -302,9 +367,20 @@ class InteractiveNode:
         elif typ == "STOP":
             self.running = False
 
-    def run(self, startup_scenario: str | None = None, autorun: bool = False) -> None:
+    def run(
+        self,
+        startup_scenario: str | None = None,
+        autorun: bool = False,
+        startup_delay: str | None = None,
+    ) -> None:
         print(f"=== LIVE TIAN SOFTWARE {self.name} (node_id={self.node_id}) ===", flush=True)
         print("Type /help for commands. Normal text sends immediately when the channel is available.", flush=True)
+        print("Scenario pacing defaults to NORMAL. Use /delay slow if you want easier-to-read scripted playback.", flush=True)
+        if startup_delay is not None:
+            try:
+                self.scenario.set_delay(startup_delay)
+            except ValueError as exc:
+                print(f"[ERROR] startup delay: {exc}; using normal", flush=True)
         if startup_scenario:
             try:
                 self.scenario.load(startup_scenario)
@@ -357,8 +433,16 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=1.2)
     parser.add_argument("--scenario", help="optional node scenario JSON to preload")
     parser.add_argument("--autorun", action="store_true", help="start preloaded scenario immediately")
+    parser.add_argument(
+        "--delay",
+        help="scenario pacing: normal, slow, very-slow, or custom extra seconds",
+    )
     args = parser.parse_args()
-    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(args.scenario, args.autorun)
+    InteractiveNode(args.name, args.id, args.host, args.port, args.timeout).run(
+        args.scenario,
+        args.autorun,
+        args.delay,
+    )
 
 
 if __name__ == "__main__":
