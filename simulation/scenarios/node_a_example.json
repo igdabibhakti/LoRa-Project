@@ -1,0 +1,20 @@
+{
+  "name": "Example scenario for Tian A",
+  "actions": [
+    {
+      "delay": 0,
+      "type": "text",
+      "text": "Hello B, this message comes from A's scenario"
+    },
+    {
+      "delay": 2,
+      "type": "text",
+      "text": "A is sending its second scripted message"
+    },
+    {
+      "delay": 3,
+      "type": "text",
+      "text": "A scenario finished"
+    }
+  ]
+}
