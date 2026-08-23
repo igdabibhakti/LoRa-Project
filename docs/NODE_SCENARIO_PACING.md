@@ -1,39 +1,51 @@
-# Per-Node Scenario Pacing (`/delay`)
+# Per-Node Scenario Action Pacing (`/pacing`)
 
-Live Tian A and Tian B now each have an independent scenario pacing control.
+Live Tian A and Tian B each have an independent **scenario action pacing** control.
 
-This setting changes **only how quickly a loaded node scenario queues its next scripted action**. It does not slow down manually typed messages, LoRe packet transmission, NACK/COMPLETE timing, or the channel panel.
+Important: this is NOT packet transmission delay.
+
+The timing controls are now deliberately separated:
+
+```text
+/delay  = real delay between protocol frames (DATA/END/NACK/COMPLETE)
+/pacing = extra delay between scripted scenario actions/messages
+```
+
+For real packet-by-packet slowing, see [`REAL_PACKET_DELAY.md`](REAL_PACKET_DELAY.md).
 
 ## Fast mental model
 
 ```text
-JSON action delay + node pacing delay = wait before that scripted action
+JSON action delay + node scenario pacing = wait before that scripted action
 ```
 
-The first scripted action does not receive the extra pacing delay. From the second action onward, the selected node pacing is added to each action's JSON `delay`.
+The first scripted action does not receive the extra pacing delay. From the second action onward, the selected scenario pacing is added to each action's JSON `delay`.
 
-## Presets normal people can understand quickly
+## Presets
 
 | Command | Extra pause between scripted actions | What it feels like |
 | --- | ---: | --- |
-| `/delay normal` | +0 seconds | Normal simulation speed. Uses the JSON delays exactly as written. |
-| `/delay slow` | +2 seconds | Easy to watch. Good when a person wants to follow the terminal logs. |
-| `/delay very-slow` | +5 seconds | Demo/debug speed. Plenty of time to read every step. |
-| `/delay 1.5` | +1.5 seconds | Custom pacing. Any non-negative number is accepted. |
+| `/pacing normal` | +0 seconds | Uses the scenario action delays exactly as written. |
+| `/pacing slow` | +2 seconds | Easier to follow the conversation/actions. |
+| `/pacing very-slow` | +5 seconds | Demo/debug action pacing. |
+| `/pacing 1.5` | +1.5 seconds | Custom pacing. |
 
-Default is:
+Default is normally:
 
 ```text
-/delay normal
+/pacing normal
 ```
 
-## Example: NORMAL versus SLOW
+A scenario may also save its own `pacing` value, which is restored when that scenario is selected.
 
-Suppose a Tian A scenario contains:
+## Example
+
+Suppose Tian A contains:
 
 ```json
 {
   "name": "A three-message demo",
+  "pacing": "normal",
   "actions": [
     {"delay": 0, "type": "text", "text": "Message 1"},
     {"delay": 1, "type": "text", "text": "Message 2"},
@@ -42,198 +54,107 @@ Suppose a Tian A scenario contains:
 }
 ```
 
-### NORMAL
-
-Run:
+With:
 
 ```text
-A> /delay normal
-A> /run
+A> /pacing normal
 ```
 
-Expected scenario timing is approximately:
+approximately:
 
 ```text
-0s   Message 1 queued
-1s   Message 2 queued
-2s   Message 3 queued
+0s  Message 1 queued
+1s  Message 2 queued
+2s  Message 3 queued
 ```
 
-Why? `normal` adds zero seconds, so only the JSON delays are used.
+With:
 
-### SLOW
+```text
+A> /pacing slow
+```
 
-Run:
+approximately:
+
+```text
+0s  Message 1 queued
+3s  Message 2 queued  (1s action delay + 2s pacing)
+6s  Message 3 queued  (1s action delay + 2s pacing)
+```
+
+Notice that this says nothing about how quickly DATA #0, DATA #1, DATA #2 are transmitted inside each message.
+
+To slow those actual frames, use:
 
 ```text
 A> /delay slow
-A> /run
 ```
 
-Expected scenario timing is approximately:
+which currently means 0.25 seconds between protocol frames.
+
+## Example combining both controls
 
 ```text
-0s   Message 1 queued
-3s   Message 2 queued     (JSON 1s + slow 2s)
-6s   Message 3 queued     (JSON 1s + slow 2s)
-```
-
-This is usually the easiest mode for a human watching the three terminals.
-
-### VERY SLOW
-
-Run:
-
-```text
+A> /pacing slow
 A> /delay very-slow
-A> /run
 ```
 
-Expected scenario timing is approximately:
+means:
 
 ```text
-0s   Message 1 queued
-6s   Message 2 queued     (JSON 1s + 5s)
-12s  Message 3 queued     (JSON 1s + 5s)
+Scenario actions/messages:
+  +2 seconds extra between scripted actions
+
+Inside each protocol transmission window:
+  1 second between DATA/END/etc. frames sent by this Tian node
 ```
 
-Use this when demonstrating packet flow to someone or reading the panel carefully.
+These are independent.
 
-## Check the current pacing
+## Check current values
 
-Type `/delay` without an argument:
+```text
+A> /pacing
+```
+
+shows scenario action pacing.
 
 ```text
 A> /delay
 ```
 
-Example output:
+shows real transmission frame delay.
 
 ```text
-[DELAY] slow = +2s between scripted actions
-[DELAY] examples: normal=+0s, slow=+2s, very-slow=+5s, /delay 1.5=+1.5s
+A> /status
 ```
 
-`/scenario` and `/status` also report the active pacing setting.
+shows both.
 
 ## A and B are independent
-
-You can make A run normally and B run slowly:
-
-```text
-A> /delay normal
-B> /delay slow
-```
-
-This is intentional. Each Tian process owns its own scenario player.
 
 Example:
 
 ```text
-Tian A scenario pacing = normal (+0s)
-Tian B scenario pacing = slow   (+2s)
-```
-
-A changing its pacing does not change B.
-
-## Change pacing before running a scenario
-
-Recommended workflow:
-
-```text
-A> /load simulation/scenarios/node_a_example.json
+A> /pacing normal
 A> /delay slow
-A> /scenario
-A> /run
-```
 
-For B:
-
-```text
-B> /load simulation/scenarios/node_b_example.json
+B> /pacing very-slow
 B> /delay normal
-B> /run
 ```
 
-## Change pacing while a scenario is running
+A can therefore generate scenario actions normally while showing its packets slowly, while B can generate actions very slowly but emit its own frames at normal simulator speed.
 
-The command can be changed while the node is alive. The new value is used when later actions calculate their wait time. For the most predictable demonstration, set the pacing before `/run`.
+## Scenario builder
 
-## Start with pacing from the command line
+The terminal scenario builder still stores a scenario-level `pacing` field.
 
-The live launcher supports separate values for A and B:
-
-```bash
-python3 simulation/launch_live_terminals.py \
-  --a-scenario simulation/scenarios/node_a_example.json \
-  --b-scenario simulation/scenarios/node_b_example.json \
-  --a-delay normal \
-  --b-delay slow \
-  --autorun
-```
-
-This means:
+Use:
 
 ```text
-A scenario = loaded and starts at NORMAL speed
-B scenario = loaded and starts at SLOW speed
+/scenario make
 ```
 
-Custom values also work:
+then choose the pacing menu option. This controls scenario-action timing only.
 
-```bash
---a-delay 1.5
---b-delay 4
-```
-
-## Easy menu behavior
-
-When `./RUN_ME.sh` -> `LIVE INTERACTIVE A <-> B` is selected and a startup node scenario is provided, the launcher now explains the available speeds:
-
-```text
-normal    = +0 seconds between scripted actions; uses JSON delays exactly
-slow      = +2 seconds between scripted actions; easy to follow by eye
-very-slow = +5 seconds between scripted actions; best for demos/debugging
-number    = custom extra seconds, for example 1.5
-```
-
-A and B are asked separately, so they may start at different speeds.
-
-## Important: this is NOT radio delay
-
-`/delay slow` does NOT mean "make every LoRa packet take 2 seconds longer."
-
-It only affects the scenario generator:
-
-```text
-scenario action
-      |
-      | wait JSON delay + node pacing
-      v
-Tian outgoing queue
-      |
-      v
-normal channel contention / DATA / END / NACK / COMPLETE
-```
-
-If you want to simulate propagation latency, packet loss, NACK loss, or COMPLETE loss, that belongs to the **channel/panel simulation**, not this node pacing command.
-
-## Recommended presets
-
-For everyday automated tests:
-
-```text
-/delay normal
-```
-
-For watching the protocol manually:
-
-```text
-/delay slow
-```
-
-For teaching, presentations, screenshots, or careful debugging:
-
-```text
-/delay very-slow
-```
+Real per-frame transmission delay remains a live Tian runtime control (`/delay`) and is intentionally separate from the saved scenario action timing.
