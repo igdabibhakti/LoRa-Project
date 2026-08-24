@@ -6,7 +6,7 @@ import queue
 import random
 from pathlib import Path
 
-from simulation.channel_scenario_manager import ChannelScenarioStore, run_channel_builder
+from simulation.channel_scenario_manager_v2 import ChannelScenarioStore, run_channel_builder
 from simulation.per_transmission_panel import PerTransmissionPanel
 
 ROOT = Path(__file__).resolve().parents[1]
