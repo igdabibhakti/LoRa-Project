@@ -7,13 +7,13 @@ import random
 from pathlib import Path
 
 from simulation.channel_scenario_manager import ChannelScenarioStore, run_channel_builder
-from simulation.panel import Panel
+from simulation.per_transmission_panel import PerTransmissionPanel
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER_COMMANDS = {"make", "new", "edit", "builder"}
 
 
-class LivePanel(Panel):
+class LivePanel(PerTransmissionPanel):
     """Streaming Panel plus terminal-only channel scenario management."""
 
     def __init__(self, cfg: dict, scenario_path: str | Path | None = None):
@@ -103,7 +103,7 @@ class LivePanel(Panel):
         if not subcommand:
             print(
                 f"[PANEL] channel scenario={self.scenario_path or '(startup/in-memory)'} "
-                f"sequence_position={self.seq_i}/{len(self.cfg.get('sequences', []))}",
+                f"transmission_position={self.seq_i}/{len(self.cfg.get('sequences', []))}",
                 flush=True,
             )
             print("Use /scenario list | select <n/name> | preview | make", flush=True)
@@ -122,22 +122,18 @@ class LivePanel(Panel):
                 self.log(f"cannot select channel scenario: {exc}")
             return
         if subcommand in BUILDER_COMMANDS:
-            # Normal terminal input is intercepted in stdin_worker so there is
-            # never a second input() reader. This is only a defensive fallback.
             self.log("type /scenario make directly at PANEL> to open the builder")
             return
         self.log("usage: /scenario list | select <number/name/path> | preview | make")
 
     def load_channel_scenario(self, raw_path: str | Path) -> None:
-        if self.active_tx_window is not None:
+        if self.active_tx_window is not None or self.active_nack_tx:
             self.log(
-                "cannot switch channel scenario while a DATA/END window is active; "
-                "wait until the current transmission round finishes"
+                "cannot switch channel scenario while a transmission is active; "
+                "wait until the current DATA/NACK transmission finishes"
             )
             return
         path, cfg = self.scenario_store.load(raw_path)
-        # Keep an already-owned transaction alive, but restart loss-sequence
-        # indexing for the next transmission round under the newly selected cfg.
         self.cfg = cfg
         self.scenario_path = path
         self.rng = random.Random(cfg.get("seed"))
@@ -145,12 +141,15 @@ class LivePanel(Panel):
         self.response_seq.clear()
         self.pending_retry_indexes.clear()
         self.nack_pages.clear()
+        self.active_nack_tx.clear()
+        self.continuous_probability_loss = None
         self.latest_sequence_metadata = None
         self.log(f"preloaded channel scenario: {path}")
         self.scenario_store.preview(cfg, path, "PRELOADED CHANNEL SCENARIO")
 
     def run(self, host, port):
         print("Live channel scenario commands: /scenario list | select | preview | make", flush=True)
+        print("Channel scenarios are consumed per transmission: DATA, END, NACK, COMPLETE.", flush=True)
         return super().run(host, port)
 
 
