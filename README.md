@@ -1,4 +1,4 @@
-# LoRe Project — Dynamic Both-Send Tian Software
+# LoRe Project — Dynamic Duplex Coms TIAN Software
 
 This branch is the current reference implementation for the laptop-side **Tian Software** reliability layer before the real ESP32 + LoRa transport is connected.
 
