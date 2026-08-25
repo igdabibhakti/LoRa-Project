@@ -6,7 +6,8 @@ import queue
 import random
 from pathlib import Path
 
-from simulation.channel_scenario_manager_v2 import ChannelScenarioStore, run_channel_builder
+from simulation.channel_scenario_manager import ChannelScenarioStore
+from simulation.channel_scenario_manager_v2 import run_channel_builder_v2
 from simulation.per_transmission_panel import PerTransmissionPanel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +41,7 @@ class LivePanel(PerTransmissionPanel):
                 continue
             if self._builder_requested(raw):
                 try:
-                    new_path = run_channel_builder(
+                    new_path = run_channel_builder_v2(
                         self.scenario_store,
                         self.scenario_path,
                         self.cfg,
@@ -143,6 +144,7 @@ class LivePanel(PerTransmissionPanel):
         self.nack_pages.clear()
         self.active_nack_tx.clear()
         self.continuous_probability_loss = None
+        self.continuous_control_drops = None
         self.latest_sequence_metadata = None
         self.log(f"preloaded channel scenario: {path}")
         self.scenario_store.preview(cfg, path, "PRELOADED CHANNEL SCENARIO")
