@@ -14,14 +14,16 @@ class PerTransmissionPanel(Panel):
     of one paged NACK) and COMPLETE each consume their own sequence as well.
 
     Manual indexes and random_count are always one-transmission rules. A
-    random_probability rule may set ``continuous=true``; once encountered on a
-    DATA transmission, that probability becomes the fallback DATA-loss rule for
-    later DATA transmissions that do not have an explicit DATA-loss rule.
+    random_probability rule may set ``continuous=true``. Once encountered, both
+    its DATA probability and its END/NACK/COMPLETE drop flags persist as fallback
+    channel behavior for later transmissions. A later continuous-probability
+    rule replaces that persistent behavior.
     """
 
     def __init__(self, cfg, live=False):
         super().__init__(cfg, live=live)
         self.continuous_probability_loss = None
+        self.continuous_control_drops = None
         self.active_nack_tx = {}
 
     def _consume_sequence(self):
@@ -30,28 +32,72 @@ class PerTransmissionPanel(Panel):
         self.seq_i += 1
         return seq_idx, seq
 
+    def _remember_continuous_policy(self, seq):
+        loss = seq.get("data_loss", {"mode": "none"})
+        if loss.get("mode", "none") != "random_probability" or not bool(
+            loss.get("continuous", False)
+        ):
+            return False
+
+        self.continuous_probability_loss = {
+            "mode": "random_probability",
+            "probability": float(loss.get("probability", 0)),
+            "continuous": True,
+        }
+        self.continuous_control_drops = {
+            "drop_end": bool(seq.get("drop_end", False)),
+            "drop_nack": bool(seq.get("drop_nack", False)),
+            "drop_complete": bool(seq.get("drop_complete", False)),
+        }
+        enabled_controls = [
+            name.upper().replace("DROP_", "")
+            for name, enabled in self.continuous_control_drops.items()
+            if enabled
+        ]
+        control_text = ",".join(enabled_controls) if enabled_controls else "none"
+        self.log(
+            f"{seq.get('name','')} enables continuous random_probability="
+            f"{self.continuous_probability_loss['probability'] * 100:g}% "
+            f"control_drops={control_text}"
+        )
+        return True
+
     def _effective_data_sequence(self, seq):
         loss = seq.get("data_loss", {"mode": "none"})
         mode = loss.get("mode", "none")
 
-        if mode == "random_probability" and bool(loss.get("continuous", False)):
-            self.continuous_probability_loss = {
-                "mode": "random_probability",
-                "probability": float(loss.get("probability", 0)),
-                "continuous": True,
-            }
-            self.log(
-                f"{seq.get('name','')} enables continuous random_probability="
-                f"{self.continuous_probability_loss['probability'] * 100:g}%"
-            )
+        if self._remember_continuous_policy(seq):
             return seq
 
+        # Manual and random_count remain explicitly one-transmission-only. Any
+        # explicit DATA rule overrides the persistent probability for this DATA
+        # transmission only; the persistent probability resumes afterward.
         if mode != "none" or self.continuous_probability_loss is None:
             return seq
 
         effective = dict(seq)
         effective["data_loss"] = dict(self.continuous_probability_loss)
         effective["name"] = f"{seq.get('name', '')} + continuous-probability".strip()
+        return effective
+
+    def _effective_control_sequence(self, seq):
+        # A continuous probability sequence can first be consumed by a control
+        # transmission, so remember it here too, not only in DATA handling.
+        self._remember_continuous_policy(seq)
+
+        if self.continuous_control_drops is None:
+            return seq
+
+        effective = dict(seq)
+        inherited = []
+        for key, persistent in self.continuous_control_drops.items():
+            if persistent:
+                inherited.append(key.replace("drop_", "").upper())
+            # Explicit current drops and persistent drops are both honored.
+            effective[key] = bool(seq.get(key, False)) or persistent
+
+        if inherited and not any(seq.get(key, False) for key in self.continuous_control_drops):
+            effective["name"] = f"{seq.get('name', '')} + continuous-controls".strip()
         return effective
 
     def start_data_window(self, sender, frame):
@@ -87,7 +133,8 @@ class PerTransmissionPanel(Panel):
         return self.active_tx_window
 
     def _deliver_control(self, sender, data64, frame):
-        seq_idx, seq = self._consume_sequence()
+        seq_idx, configured_seq = self._consume_sequence()
+        seq = self._effective_control_sequence(configured_seq)
         delivered = self.deliver(sender, data64, seq_idx, seq)
         return seq_idx, seq, delivered
 
@@ -122,7 +169,8 @@ class PerTransmissionPanel(Panel):
         key = (sender, frame.message_id)
         state = self.active_nack_tx.get(key)
         if state is None:
-            seq_idx, seq = self._consume_sequence()
+            seq_idx, configured_seq = self._consume_sequence()
+            seq = self._effective_control_sequence(configured_seq)
             state = {
                 "seq_idx": seq_idx,
                 "seq": seq,
