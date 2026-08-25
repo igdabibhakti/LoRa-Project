@@ -5,8 +5,8 @@ before packetization: application metadata, image compression and AES-GCM.
 The ESP32/serial transport never needs to understand this format.
 
 Trace dictionaries are intentionally observational only. They let the live
-experiment show the classic Tian encode/decode process without changing bytes
-sent by the protocol.
+experiment show the classic Tian encode/decode process without changing the
+reliability protocol.
 """
 from __future__ import annotations
 
@@ -27,6 +27,13 @@ SHARED_KEY = b"12345678901234567890123456789012"  # Demo/test key only.
 APP_HEADER_FORMAT = ">Q"
 APP_HEADER_SIZE = struct.calcsize(APP_HEADER_FORMAT)
 TRACE_HEX_BYTES = 48
+
+# Image filename metadata is inside the encrypted application payload. This is
+# intentionally above lore_protocol.py: packet reliability does not need to know
+# anything about filenames.
+IMAGE_META_MAGIC = b"TIANIMG1"
+IMAGE_NAME_LEN_FORMAT = ">H"
+IMAGE_NAME_LEN_SIZE = struct.calcsize(IMAGE_NAME_LEN_FORMAT)
 
 
 def hex_preview(data: bytes, limit: int = TRACE_HEX_BYTES) -> str:
@@ -70,6 +77,73 @@ def _unpack_application(raw: bytes) -> tuple[int, bytes]:
         raise ValueError("application payload is missing timestamp")
     sent_at_ms = struct.unpack(APP_HEADER_FORMAT, raw[:APP_HEADER_SIZE])[0]
     return sent_at_ms, raw[APP_HEADER_SIZE:]
+
+
+def _safe_basename(name: str) -> str:
+    """Keep only the basename so a transmitted name can never escape its folder."""
+    return Path(name).name or "received.jpg"
+
+
+def _pack_image_payload(filename: str, compressed_jpeg: bytes) -> bytes:
+    safe_name = _safe_basename(filename)
+    encoded_name = safe_name.encode("utf-8")
+    if len(encoded_name) > 65535:
+        raise ValueError("image filename is too long to transmit")
+    return (
+        IMAGE_META_MAGIC
+        + struct.pack(IMAGE_NAME_LEN_FORMAT, len(encoded_name))
+        + encoded_name
+        + compressed_jpeg
+    )
+
+
+def _unpack_image_payload(application: bytes) -> tuple[str | None, bytes]:
+    """Return embedded filename and compressed JPEG; accept old payloads too."""
+    if not application.startswith(IMAGE_META_MAGIC):
+        return None, application
+    offset = len(IMAGE_META_MAGIC)
+    if len(application) < offset + IMAGE_NAME_LEN_SIZE:
+        raise ValueError("image metadata is truncated before filename length")
+    name_len = struct.unpack(
+        IMAGE_NAME_LEN_FORMAT,
+        application[offset : offset + IMAGE_NAME_LEN_SIZE],
+    )[0]
+    offset += IMAGE_NAME_LEN_SIZE
+    if len(application) < offset + name_len:
+        raise ValueError("image metadata is truncated inside filename")
+    filename = application[offset : offset + name_len].decode("utf-8", errors="replace")
+    return _safe_basename(filename), application[offset + name_len :]
+
+
+def _save_processed_image(jpeg: bytes, target: Path) -> int:
+    """Preserve the transmitted filename while keeping its file format honest.
+
+    Tian transports a resized JPEG internally. If the original filename used a
+    non-JPEG extension, re-encode that received visual into the matching common
+    image format before saving it under the original name.
+    """
+    suffix = target.suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".jfif", ""}:
+        target.write_bytes(jpeg)
+        return target.stat().st_size
+
+    format_by_suffix = {
+        ".png": "PNG",
+        ".webp": "WEBP",
+        ".bmp": "BMP",
+        ".gif": "GIF",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+    }
+    output_format = format_by_suffix.get(suffix)
+    if output_format is None:
+        # Unknown extension: preserve the exact requested name and the JPEG data.
+        target.write_bytes(jpeg)
+        return target.stat().st_size
+
+    with Image.open(io.BytesIO(jpeg)) as image:
+        image.save(target, format=output_format)
+    return target.stat().st_size
 
 
 def prepare_text(text: str) -> PreparedPayload:
@@ -117,8 +191,9 @@ def prepare_image(path: str | Path) -> PreparedPayload:
     image.save(jpeg, format="JPEG", quality=50)
     jpeg_bytes = jpeg.getvalue()
     compressed = zlib.compress(jpeg_bytes, level=9)
+    image_payload = _pack_image_payload(source.name, compressed)
     sent_at_ms = int(time.time() * 1000)
-    application = _pack_application(compressed, sent_at_ms)
+    application = _pack_application(image_payload, sent_at_ms)
     encrypted = encrypt(application)
 
     return PreparedPayload(
@@ -143,6 +218,8 @@ def prepare_image(path: str | Path) -> PreparedPayload:
             "compression": "zlib level 9",
             "compressed_bytes": len(compressed),
             "compressed_hex": hex_preview(compressed),
+            "filename_metadata": source.name,
+            "filename_metadata_bytes": len(image_payload) - len(compressed),
             "application_header_bytes": APP_HEADER_SIZE,
             "application_bytes": len(application),
             "encryption": "AES-GCM (12B nonce + cipher + 16B tag)",
@@ -190,25 +267,29 @@ def decode_received(
         }
 
     if content_type == ContentType.IMAGE:
-        jpeg = zlib.decompress(application)
+        filename, compressed = _unpack_image_payload(application)
+        jpeg = zlib.decompress(compressed)
         folder = Path(output_dir)
         folder.mkdir(parents=True, exist_ok=True)
-        target = folder / f"{output_stem}.jpg"
-        target.write_bytes(jpeg)
+        target = folder / (filename if filename else f"{output_stem}.jpg")
+        saved_bytes = _save_processed_image(jpeg, target)
         with Image.open(io.BytesIO(jpeg)) as image:
             dimensions = image.size
         trace.update({
+            "filename": filename or target.name,
             "decompression": "zlib -> JPEG",
             "jpeg_bytes": len(jpeg),
             "jpeg_hex": hex_preview(jpeg),
             "dimensions": f"{dimensions[0]}x{dimensions[1]}",
+            "saved_bytes": saved_bytes,
             "saved_path": str(target.resolve()),
         })
         return {
             "type": "image",
             "sent_at_ms": sent_at_ms,
+            "filename": filename or target.name,
             "path": str(target.resolve()),
-            "bytes": len(jpeg),
+            "bytes": saved_bytes,
             "width": dimensions[0],
             "height": dimensions[1],
             "trace": trace,
