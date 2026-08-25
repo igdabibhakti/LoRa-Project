@@ -9,16 +9,24 @@ from simulation.panel import Panel
 class PerTransmissionPanel(Panel):
     """Panel variant where each logical transmission consumes its own scenario.
 
-    A DATA burst consumes one sequence when its first DATA frame arrives. The END
-    that closes that burst consumes the next sequence. NACK (including all pages
-    of one paged NACK) and COMPLETE each consume their own sequence as well.
+    A DATA burst consumes one sequence when its first DATA frame arrives. END,
+    NACK, and COMPLETE consume their own transmission sequences.
 
-    Manual indexes and random_count are always one-transmission rules. A
-    random_probability rule may set ``continuous=true``. Once encountered, both
-    its DATA probability and its END/NACK/COMPLETE drop flags persist as fallback
-    channel behavior for later transmissions. A later continuous-probability
-    rule replaces that persistent behavior.
+    Manual indexes and random_count remain one-transmission DATA rules. For a
+    random_probability rule, selected control flags (END/NACK/COMPLETE) mean
+    "include this frame type in the same probability simulation". Every DATA or
+    selected control frame gets an independent fresh probability roll.
+
+    When ``continuous=true``, both the DATA probability and the selected control
+    frame types remain active as fallback channel behavior for later
+    transmissions. A later continuous probability rule replaces that policy.
     """
+
+    CONTROL_FLAG_BY_TYPE = {
+        FrameType.END: "drop_end",
+        FrameType.NACK: "drop_nack",
+        FrameType.COMPLETE: "drop_complete",
+    }
 
     def __init__(self, cfg, live=False):
         super().__init__(cfg, live=live)
@@ -50,15 +58,15 @@ class PerTransmissionPanel(Panel):
             "drop_complete": bool(seq.get("drop_complete", False)),
         }
         enabled_controls = [
-            name.upper().replace("DROP_", "")
-            for name, enabled in self.continuous_control_drops.items()
+            key.replace("drop_", "").upper()
+            for key, enabled in self.continuous_control_drops.items()
             if enabled
         ]
         control_text = ",".join(enabled_controls) if enabled_controls else "none"
         self.log(
             f"{seq.get('name','')} enables continuous random_probability="
             f"{self.continuous_probability_loss['probability'] * 100:g}% "
-            f"control_drops={control_text}"
+            f"applies_to=DATA{(',' + control_text) if control_text != 'none' else ''}"
         )
         return True
 
@@ -69,9 +77,8 @@ class PerTransmissionPanel(Panel):
         if self._remember_continuous_policy(seq):
             return seq
 
-        # Manual and random_count remain explicitly one-transmission-only. Any
-        # explicit DATA rule overrides the persistent probability for this DATA
-        # transmission only; the persistent probability resumes afterward.
+        # Explicit one-shot DATA rules override the persistent DATA probability
+        # for this transmission only. The continuous rule resumes afterward.
         if mode != "none" or self.continuous_probability_loss is None:
             return seq
 
@@ -81,24 +88,70 @@ class PerTransmissionPanel(Panel):
         return effective
 
     def _effective_control_sequence(self, seq):
-        # A continuous probability sequence can first be consumed by a control
-        # transmission, so remember it here too, not only in DATA handling.
-        self._remember_continuous_policy(seq)
+        # A continuous probability rule may itself be consumed by a control
+        # transmission, so activate it here too.
+        remembered = self._remember_continuous_policy(seq)
+        loss = seq.get("data_loss", {"mode": "none"})
 
-        if self.continuous_control_drops is None:
+        # An explicit random-probability sequence uses its own selected control
+        # types and probability for this transmission.
+        if loss.get("mode") == "random_probability":
+            return seq
+
+        # Otherwise inherit the persistent probability policy, if any.
+        if self.continuous_probability_loss is None or self.continuous_control_drops is None:
             return seq
 
         effective = dict(seq)
-        inherited = []
-        for key, persistent in self.continuous_control_drops.items():
-            if persistent:
-                inherited.append(key.replace("drop_", "").upper())
-            # Explicit current drops and persistent drops are both honored.
-            effective[key] = bool(seq.get(key, False)) or persistent
-
-        if inherited and not any(seq.get(key, False) for key in self.continuous_control_drops):
-            effective["name"] = f"{seq.get('name', '')} + continuous-controls".strip()
+        effective["data_loss"] = dict(self.continuous_probability_loss)
+        for key, selected in self.continuous_control_drops.items():
+            effective[key] = bool(seq.get(key, False)) or selected
+        if not remembered:
+            effective["name"] = f"{seq.get('name', '')} + continuous-probability".strip()
         return effective
+
+    def _probability_control_drop(self, seq, frame):
+        """Return None for deterministic control rules, else a probability roll."""
+        flag = self.CONTROL_FLAG_BY_TYPE.get(frame.frame_type)
+        if flag is None:
+            return None
+
+        loss = seq.get("data_loss", {"mode": "none"})
+        if loss.get("mode") != "random_probability":
+            return None
+        if not bool(seq.get(flag, False)):
+            return False
+
+        p = max(0.0, min(1.0, float(loss.get("probability", 0))))
+        roll = self.rng.random()
+        dropped = roll < p
+        self.log(
+            f"{seq.get('name','')} random_probability {frame.frame_type.name} "
+            f"roll={roll:.4f} threshold={p:.4f} -> {'DROP' if dropped else 'PASS'}"
+        )
+        return dropped
+
+    def _deliver_control_frame(self, sender, data64, frame, seq_idx, seq):
+        probability_drop = self._probability_control_drop(seq, frame)
+        if probability_drop is None:
+            # Non-probability scenarios keep the original deterministic control
+            # drop behavior.
+            return self.deliver(sender, data64, seq_idx, seq)
+
+        # Base deliver() treats drop_end/drop_nack/drop_complete as deterministic
+        # booleans. Clear them here because random-probability mode has already
+        # made the independent roll above.
+        sanitized = dict(seq)
+        sanitized["drop_end"] = False
+        sanitized["drop_nack"] = False
+        sanitized["drop_complete"] = False
+        return self.deliver(
+            sender,
+            data64,
+            seq_idx,
+            sanitized,
+            force_drop=probability_drop,
+        )
 
     def start_data_window(self, sender, frame):
         seq_idx, configured_seq = self._consume_sequence()
@@ -135,7 +188,7 @@ class PerTransmissionPanel(Panel):
     def _deliver_control(self, sender, data64, frame):
         seq_idx, configured_seq = self._consume_sequence()
         seq = self._effective_control_sequence(configured_seq)
-        delivered = self.deliver(sender, data64, seq_idx, seq)
+        delivered = self._deliver_control_frame(sender, data64, frame, seq_idx, seq)
         return seq_idx, seq, delivered
 
     def remember_delivered_nack(self, frame, seq_idx):
@@ -188,7 +241,7 @@ class PerTransmissionPanel(Panel):
 
         seq_idx = state["seq_idx"]
         seq = state["seq"]
-        delivered = self.deliver(sender, data64, seq_idx, seq)
+        delivered = self._deliver_control_frame(sender, data64, frame, seq_idx, seq)
         state["seen"].add(frame.packet_index)
 
         if delivered:
