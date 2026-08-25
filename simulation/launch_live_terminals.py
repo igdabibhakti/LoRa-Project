@@ -12,6 +12,11 @@ ap.add_argument("--b-delay", default="normal", help="B REAL inter-frame TX delay
 ap.add_argument("--a-pacing", help="optional A scenario action pacing override")
 ap.add_argument("--b-pacing", help="optional B scenario action pacing override")
 ap.add_argument("--autorun", action="store_true", help="autorun any preloaded node scenarios")
+ap.add_argument(
+    "--chat-only",
+    action="store_true",
+    help="start both nodes with backend logs hidden; /logs on restores them",
+)
 args = ap.parse_args()
 
 panel_scenario = str(Path(args.panel_scenario).expanduser().resolve())
@@ -24,9 +29,11 @@ for name, node_id, scenario, delay, pacing in [
     ("B", 2, args.b_scenario, args.b_delay, args.b_pacing),
 ]:
     cmd = (
-        f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.interactive_node "
+        f"cd {shlex.quote(str(root))}; {shlex.quote(py)} -m simulation.chat_node "
         f"--name {name} --id {node_id} --delay {shlex.quote(str(delay))}"
     )
+    if args.chat_only:
+        cmd += " --chat-only"
     if pacing is not None:
         cmd += f" --pacing {shlex.quote(str(pacing))}"
     if scenario:
@@ -54,6 +61,9 @@ for command in commands:
 print("Started live 3-terminal simulation")
 print(f"Panel channel scenario: {panel_scenario}")
 print("Panel terminal supports: /scenario list | select | preview | make")
+print("Nodes use simulation.chat_node (chat/full-log switch + received-image preview).")
+print("Node commands: /logs off | /logs on | /logs last | /image-preview auto")
+print(f"Startup node display: {'chat-only' if args.chat_only else 'full experiment logs'}")
 print(f"A REAL TX frame delay: {args.a_delay}")
 print(f"B REAL TX frame delay: {args.b_delay}")
 if args.a_pacing is not None: print(f"A scenario action pacing override: {args.a_pacing}")
