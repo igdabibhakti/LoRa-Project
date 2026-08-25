@@ -6,8 +6,7 @@ import queue
 import random
 from pathlib import Path
 
-from simulation.channel_scenario_manager import ChannelScenarioStore
-from simulation.channel_scenario_manager_v2 import run_channel_builder_v2
+from simulation.channel_scenario_manager_v2 import ChannelScenarioStore, run_channel_builder
 from simulation.per_transmission_panel import PerTransmissionPanel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +40,7 @@ class LivePanel(PerTransmissionPanel):
                 continue
             if self._builder_requested(raw):
                 try:
-                    new_path = run_channel_builder_v2(
+                    new_path = run_channel_builder(
                         self.scenario_store,
                         self.scenario_path,
                         self.cfg,
